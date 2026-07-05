@@ -18,6 +18,7 @@ import difflib
 from typing import Optional
 
 import openpi.models.pi0_config as pi0_config
+import openpi.transforms as _transforms
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 from openpi.training.config import (
@@ -435,6 +436,7 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_droid_polaris",
         model=pi0_config.Pi0Config(
+            
             action_horizon=15,
             pi05=True,
             max_token_len=200,
@@ -447,22 +449,29 @@ _CONFIGS = [
         pytorch_weight_path="checkpoints/torch/pi05_droid_polaris",
     ),
     TrainConfig(
-        # pi0.5 SFT'd on the piper "insert mouse battery" task. Defaults
-        # (action_horizon=50, action_dim=32) match
-        # huggingface.co/Shirk6/pi05-piper-insert-mouse-battery-run2-30000-pytorch
-        # config.json. Public piper SFTs in kai0 use absolute joints
-        # (use_delta_joint_actions=False); flip if your SFT used deltas.
+        # Matches kai0 pi05_piper_insert_mouse_battery_normal.
         name="pi05_piper",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=50,
-            discrete_state_input=False,
-        ),
+        model=pi0_config.Pi0Config(pi05=True),
         data=LerobotAgilexDataConfig(
-            repo_id="Shirk6/piper-insert-mouse-battery",  # not loaded at inference
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_piper/assets"),
+            repo_id="/project/peilab/srk/wmpo_workspace/piper_insert_mouse_battery_lerobot",
+            default_prompt="Insert the battery into the mouse.",
+            assets=AssetsConfig(asset_id="assets"),
             use_delta_joint_actions=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "top_head": "observation.images.cam_high",
+                                "hand_left": "observation.images.cam_left_wrist",
+                                "hand_right": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
         ),
         pytorch_weight_path="checkpoints/torch/pi05_piper",
     ),

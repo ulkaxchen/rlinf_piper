@@ -19,6 +19,7 @@ Ported from OpenDriveLab/kai0 (``src/openpi/training/config.py``
 here too. Flip to True if your specific SFT was trained on deltas.
 """
 import dataclasses
+import inspect
 import pathlib
 from typing import Sequence
 
@@ -109,11 +110,16 @@ class LerobotAgilexDataConfig(DataConfigFactory):
             model_config
         )
 
+        replace_kwargs = {
+            "repack_transforms": repack_transforms,
+            "data_transforms": data_transforms,
+            "model_transforms": model_transforms,
+            "action_sequence_keys": self.action_sequence_keys,
+        }
+        if "episodes" in inspect.signature(DataConfig).parameters:
+            replace_kwargs["episodes"] = self.episodes
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transforms,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-            action_sequence_keys=self.action_sequence_keys,
-            episodes=self.episodes,
+            **replace_kwargs,
         )

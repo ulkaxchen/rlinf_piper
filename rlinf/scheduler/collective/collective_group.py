@@ -132,12 +132,15 @@ class CollectiveWorkQueue:
         self._type = comm_type
         self._logger = logger
         self._lock = threading.Lock()
+        self._exception: BaseException | None = None
         self._thread = threading.Thread(target=self._run_queue, daemon=True)
         self._thread.start()
 
     @property
     def done(self):
         """Check if the work queue is done."""
+        if self._exception is not None:
+            raise RuntimeError("Collective work queue failed") from self._exception
         return self._work_done
 
     def enqueue(
@@ -178,19 +181,24 @@ class CollectiveWorkQueue:
                 self._stream_ctx = Worker.torch_platform.stream(self._accel_stream)
 
             with self._stream_ctx:
-                if event is not None:
-                    event.wait(self._accel_stream)
-                self._logger.debug(
-                    f"Async {'send' if self._type == CollectiveWorkQueue.SEND else 'recv'} ID {comm_id} begins"
-                )
+                try:
+                    if event is not None:
+                        event.wait(self._accel_stream)
+                    self._logger.debug(
+                        f"Async {'send' if self._type == CollectiveWorkQueue.SEND else 'recv'} ID {comm_id} begins"
+                    )
 
-                work(None)
-                work = None  # The reference to work is released here to avoid potential memory leak
+                    work(None)
+                    work = None  # The reference to work is released here to avoid potential memory leak
 
-                self._logger.debug(
-                    f"Async {'send' if self._type == CollectiveWorkQueue.SEND else 'recv'} ID {comm_id} done"
-                )
-                self._logger.debug(f"Done comm work {work}")
+                    self._logger.debug(
+                        f"Async {'send' if self._type == CollectiveWorkQueue.SEND else 'recv'} ID {comm_id} done"
+                    )
+                    self._logger.debug(f"Done comm work {work}")
+                except BaseException as exc:
+                    self._exception = exc
+                    self._work_done = True
+                    raise
 
 
 class CollectiveGroup:

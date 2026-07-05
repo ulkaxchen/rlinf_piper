@@ -99,6 +99,9 @@ class ClusterEnvVar(str, Enum):
     Set explicitly when workers do not share a filesystem with the launch node.
     """
 
+    RAY_INCLUDE_DASHBOARD = "RAY_INCLUDE_DASHBOARD"
+    """Whether locally-started Ray should include the dashboard/state API server."""
+
 
 class PathEnvMergeMode(str, Enum):
     """Merge mode for path-like worker env vars."""
@@ -125,6 +128,7 @@ class Cluster:
         ClusterEnvVar.EXT_MODULE: None,
         ClusterEnvVar.PATH_ENV_MERGE_MODE: PathEnvMergeMode.APPEND.value,
         ClusterEnvVar.CODE_WORKING_DIR: "0",
+        ClusterEnvVar.RAY_INCLUDE_DASHBOARD: "0",
     }
     PATH_LIKE_ENV_VARS = {
         "PYTHONPATH",
@@ -334,6 +338,10 @@ class Cluster:
             ray_init_kwargs = {
                 "logging_level": Cluster.LOGGING_LEVEL,
                 "namespace": Cluster.NAMESPACE,
+                "include_dashboard": Cluster.get_sys_env_var(
+                    ClusterEnvVar.RAY_INCLUDE_DASHBOARD, "1"
+                )
+                not in ("0", "false", "False", "off", "OFF", "no", "NO"),
             }
             if self._ray_code_sync_fragment is not None:
                 ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)

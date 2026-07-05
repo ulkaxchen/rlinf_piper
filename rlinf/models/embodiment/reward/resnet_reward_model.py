@@ -137,6 +137,8 @@ class ResNetRewardModel(BaseImageRewardModel):
                 # Skip mean/std buffers (they are persistent=False, auto-created)
                 if new_key in ["mean", "std", "_mean", "_std"]:
                     continue
+                if not new_key.startswith("backbone."):
+                    new_key = f"backbone.{new_key}"
                 new_state_dict[new_key] = v
             state_dict = new_state_dict
 

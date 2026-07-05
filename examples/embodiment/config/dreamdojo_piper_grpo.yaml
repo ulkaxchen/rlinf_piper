@@ -12,14 +12,15 @@ defaults:
 # stub until the piper reward model lands, so any real training is meaningless
 # regardless of algorithm.
 #
-# Before launching rollout:
-# 1. Add an openpi dataconfig "pi05_piper" under
-#    rlinf/models/embodiment/openpi/dataconfig/ that matches piper's obs/action
-#    spec (1 RGB image, 14-dim joint-delta action padded to 32). The SFT'd
-#    pi0.5 (run2/iter30000) was trained with action_horizon=50 and internal
-#    action_dim=32; norm_stats live in the model dir's assets/norm_stats.json.
-# 2. If switching to PPO actor-critic later: set add_value_head=True and flip
-#    algorithm.loss_type=actor_critic + algorithm.adv_type=gae.
+# Notes:
+# - Policy: the openpi dataconfig "pi05_piper" (rlinf/models/embodiment/openpi/
+#   dataconfig/) matches piper's obs/action spec. It emits *absolute* 14-dim
+#   joint actions (use_delta_joint_actions=False) padded to the model's internal
+#   action_dim=32; the env min-max normalizes and diffs them into DreamDojo's
+#   training space (see env.action_norm_* keys). The SFT'd pi0.5 (run2/iter30000)
+#   used action_horizon=50; norm_stats live in assets/norm_stats.json.
+# - If switching to PPO actor-critic later: set add_value_head=True and flip
+#   algorithm.loss_type=actor_critic + algorithm.adv_type=gae.
 
 hydra:
   run:
@@ -33,32 +34,38 @@ cluster:
   component_placement:
     actor,env,rollout: all
 
+weight_syncer:
+  patch:
+    transport_device: cpu
+
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "dreamdojo_piper_grpo"
-    logger_backends: ["tensorboard"]
+    logger_backends: ["wandb"]
 
   max_epochs: 1000
   max_steps: -1
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 5
+  save_interval: 100
 
   resume_dir: null
   ckpt_path: null
+  per_worker_log: True
 
 algorithm:
   normalize_advantages: True
   kl_penalty: kl
-  group_size: 8
+  group_size: 2
 
-  reward_type: action_level
-  logprob_type: token_level
+  reward_type: chunk_level
+  logprob_type: chunk_level
   entropy_type: token_level
+  update_epoch: 1
 
   adv_type: grpo
   loss_type: actor
@@ -83,26 +90,29 @@ algorithm:
 env:
   group_name: "EnvGroup"
   train:
-    rollout_epoch: 4
-    total_num_envs: 8
+    rollout_epoch: 1
+    total_num_envs: 16
     group_size: ${algorithm.group_size}
-    max_episode_steps: 240
-    max_steps_per_rollout_epoch: 240
+    max_episode_steps: 720
+    max_steps_per_rollout_epoch: 720
     reward_coef: ${algorithm.reward_coef}
     enable_offload: True       # otherwise, may OOM at 1440x640
-    num_inference_steps: 5     # lower for faster rollout
+    success_reward_threshold: 0.9
+    num_inference_steps: 35     
   eval:
     rollout_epoch: 1
     total_num_envs: 8
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 240
-    max_steps_per_rollout_epoch: 240
+    max_episode_steps: 720
+    max_steps_per_rollout_epoch: 720
     group_size: 1
     is_eval: True
+    success_reward_threshold: 0.9
     num_inference_steps: 5
     video_cfg:
       save_video: True
+      fps: 10
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
@@ -122,31 +132,26 @@ rollout:
 
   model:
     # huggingface.co/Shirk6/pi05-piper-insert-mouse-battery-run2-30000-pytorch
-    model_path: "/mnt/afs-h200/yuyangcheng/data/pi05-piper-insert-mouse-battery-30000"
+    model_path: "/project/peilab/srk/wmpo_workspace/kai0/checkpoints/pi05_piper_insert_mouse_battery_normal/piper_insert_mouse_battery_run2/30000_pytorch"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 32
-  global_batch_size: 8192
+  micro_batch_size: 20
+  global_batch_size: 160
   seed: 1234
   enable_offload: True
 
   model:
-    model_path: "/mnt/afs-h200/yuyangcheng/data/pi05-piper-insert-mouse-battery-30000"
+    model_path: "/project/peilab/srk/wmpo_workspace/kai0/checkpoints/pi05_piper_insert_mouse_battery_normal/piper_insert_mouse_battery_run2/30000_pytorch"
     model_type: "openpi"
-    # Piper world model emits dual-arm joint deltas. Env consumes [N, 12, 14].
-    # The SFT'd pi0.5 was trained with horizon=50 / internal action_dim=32
-    # (config.json on the HF repo); openpi will be called with chunk=12 (env
-    # match) and the policy's 32-dim output is sliced to action_env_dim=14
-    # (piper's first 14 dims; remaining 18 dims are padding zeros).
-    num_action_chunks: 12
+    num_action_chunks: 36
     action_dim: 14
     add_value_head: False   # GRPO does not use a critic head
     openpi:
-      config_name: "pi05_piper"   # TODO: add matching dataconfig under rlinf/models/embodiment/openpi/dataconfig/
-      num_images_in_input: 1      # DreamDojo env returns one main image, no wrist
+      config_name: "pi05_piper"   # emits absolute 14-dim joint actions (padded to 32)
+      num_images_in_input: 3      # env splits the 1440x640 stack into top_head + 2 wrist views
       noise_level: 0.5
       action_chunk: ${..num_action_chunks}
       action_env_dim: ${..action_dim}

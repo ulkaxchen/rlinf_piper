@@ -74,6 +74,7 @@ class RecordVideo(gym.Wrapper):
 
         self.video_cfg = video_cfg
         self.render_images: list[np.ndarray] = []
+        self.per_env_render_images: dict[int, list[np.ndarray]] = {}
         self.video_cnt = 0
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -105,6 +106,22 @@ class RecordVideo(gym.Wrapper):
             return int(metadata["render_fps"])
         return 30
 
+    def offload(self):
+        """Forward memory offload calls to wrapped envs that support them."""
+        return self.env.offload()
+
+    def onload(self):
+        """Forward memory onload calls to wrapped envs that support them."""
+        return self.env.onload()
+
+    def get_state(self):
+        """Forward state serialization to wrapped envs that support it."""
+        return self.env.get_state()
+
+    def set_state(self, state):
+        """Forward state restoration to wrapped envs that support it."""
+        return self.env.set_state(state)
+
     def _to_numpy(self, value: Any) -> np.ndarray:
         """Convert tensors/arrays to numpy."""
         if torch is not None and isinstance(value, torch.Tensor):
@@ -121,6 +138,19 @@ class RecordVideo(gym.Wrapper):
             if key in obs and obs[key] is not None:
                 return obs[key]
         return None
+
+    def _get_env_video_frame_batches(self) -> list[list[np.ndarray]]:
+        """Read native video frames from env-specific record hooks when present."""
+        getter = getattr(self.env, "get_video_frame_batches", None)
+        if getter is None:
+            return []
+        frames = getter()
+        if frames is None:
+            return []
+        return frames
+
+    def _has_env_video_frame_batches(self) -> bool:
+        return getattr(self.env, "get_video_frame_batches", None) is not None
 
     def _extract_frame_batches(self, obs: Any) -> list[list[np.ndarray]]:
         """Extract a list of per-step image batches from obs."""
@@ -331,6 +361,27 @@ class RecordVideo(gym.Wrapper):
         else:
             self.render_images.append(images[0])
 
+    def _append_per_env_frame_batches(
+        self,
+        frame_batches: list[list[np.ndarray]],
+        infos: Optional[Any],
+        rewards: Optional[Any],
+        terminations: Optional[Any],
+    ) -> None:
+        """Append frame batches as independent per-env videos."""
+        for time_idx, images in enumerate(frame_batches):
+            for env_id, img in enumerate(images):
+                if img.dtype != np.uint8:
+                    img = img.astype(np.uint8)
+                if self.video_cfg.get("info_on_video", True):
+                    img = put_info_on_image(
+                        img,
+                        self._build_info_item(
+                            infos, rewards, terminations, env_id, time_idx
+                        ),
+                    )
+                self.per_env_render_images.setdefault(env_id, []).append(img)
+
     def add_new_frames(
         self,
         obs: Any,
@@ -359,7 +410,8 @@ class RecordVideo(gym.Wrapper):
     def reset(self, *args, **kwargs):
         """Reset env and record the initial frame."""
         obs, info = self.env.reset(*args, **kwargs)
-        self.add_new_frames(obs, info)
+        if not self._has_env_video_frame_batches():
+            self.add_new_frames(obs, info)
         return obs, info
 
     def step(self, action):
@@ -377,6 +429,18 @@ class RecordVideo(gym.Wrapper):
         """Record video frames from a chunk_step / async_chunk_step result tuple."""
         if isinstance(result, tuple) and len(result) >= 5:
             obs_list, rewards, terminations, _truncations, infos_list = result[:5]
+
+            native_frames = self._get_env_video_frame_batches()
+            if native_frames:
+                infos = (
+                    infos_list[-1]
+                    if isinstance(infos_list, (list, tuple))
+                    else infos_list
+                )
+                self._append_per_env_frame_batches(
+                    native_frames, infos, rewards, terminations
+                )
+                return
 
             # Some envs may skip intermediate observations for performance and return
             # None entries. Filter them out for video collection.
@@ -437,7 +501,7 @@ class RecordVideo(gym.Wrapper):
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
         """Write buffered frames to an MP4 file (async)."""
-        if not self.render_images:
+        if not self.render_images and not self.per_env_render_images:
             return
 
         output_dir = os.path.join(
@@ -447,11 +511,26 @@ class RecordVideo(gym.Wrapper):
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
 
         os.makedirs(output_dir, exist_ok=True)
-        mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
-        frames = list(self.render_images)
-        self.render_images = []
+        if self.per_env_render_images:
+            per_env_frames = {
+                env_id: list(frames)
+                for env_id, frames in self.per_env_render_images.items()
+                if frames
+            }
+            self.per_env_render_images = {}
+            for env_id, frames in per_env_frames.items():
+                env_output_dir = os.path.join(output_dir, f"env_{env_id:04d}")
+                os.makedirs(env_output_dir, exist_ok=True)
+                mp4_path = os.path.join(env_output_dir, f"{self.video_cnt}.mp4")
+                self._submit_save(frames, mp4_path)
+
+        if self.render_images:
+            mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
+            frames = list(self.render_images)
+            self.render_images = []
+            self._submit_save(frames, mp4_path)
+
         self.video_cnt += 1
-        self._submit_save(frames, mp4_path)
 
     def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> None:
         """Submit a background job to save the video."""
