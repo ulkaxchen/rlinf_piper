@@ -17,7 +17,6 @@ outputs/*
 .venv
 .venv-dreamdojo/
 .docs-venv
-uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
