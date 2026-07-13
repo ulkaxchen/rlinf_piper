@@ -94,6 +94,12 @@ class EnvWorker(Worker):
 
         # Env configurations
         self.use_training_pipeline = self.cfg.runner.get("use_training_pipeline", False)
+        self.single_gpu_serial_offload = bool(
+            self.cfg.runner.get("single_gpu_serial_offload", False)
+        )
+        self.single_gpu_serial_unload_env = bool(
+            self.cfg.runner.get("single_gpu_serial_unload_env", False)
+        )
         self.only_eval = getattr(self.cfg.runner, "only_eval", False)
         self.model_cfg = (
             self.cfg.rollout.model if self.only_eval else self.cfg.actor.model
@@ -1051,6 +1057,7 @@ class EnvWorker(Worker):
         for stage_id in range(self.stage_num):
             env_output: EnvOutput = env_outputs[stage_id]
             env_batch = env_output.to_dict()
+            self._offload_train_env_for_serial_step(stage_id)
             self.send_env_batch(
                 rollout_channel,
                 {
@@ -1063,6 +1070,10 @@ class EnvWorker(Worker):
         env_outputs = self.bootstrap_step()
         self._send_train_bootstrap(rollout_channel, env_outputs)
         return env_outputs
+
+    def _offload_train_env_for_serial_step(self, stage_id: int) -> None:
+        if self.single_gpu_serial_offload and self.train_enable_offload:
+            self.env_list[stage_id].offload()
 
     def prefetch_train_bootstrap(self, rollout_channel: Channel) -> None:
         """Prepare and send the first env batch for the next training rollout."""
@@ -1195,6 +1206,7 @@ class EnvWorker(Worker):
                         rollout_result.actions, stage_id
                     )
                     env_batch = env_output.to_dict()
+                    self._offload_train_env_for_serial_step(stage_id)
                     self.send_env_batch(
                         rollout_channel,
                         {
@@ -1308,8 +1320,22 @@ class EnvWorker(Worker):
         )
 
         for env in self.env_list:
-            if self.train_enable_offload:
-                env.offload()
+            if not self.train_enable_offload:
+                continue
+            if self.single_gpu_serial_unload_env:
+                unload = getattr(env, "unload", None)
+                if callable(unload):
+                    unload()
+                    self.log_info(
+                        "Unloaded inactive training environment after rollout "
+                        "for runner.single_gpu_serial_unload_env=True."
+                    )
+                    continue
+                self.log_warning(
+                    "runner.single_gpu_serial_unload_env=True but training env "
+                    f"{type(env).__name__} has no unload() method; using offload()."
+                )
+            env.offload()
 
         return env_metrics
 

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import math
 import random
+from contextlib import nullcontext
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -37,7 +39,12 @@ from rlinf.utils.pytree import register_pytree_dataclasses
 
 
 def _to_numpy(x):
-    return np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x
+    if not torch.is_tensor(x):
+        return x
+    x = x.detach().cpu()
+    if x.dtype == torch.bfloat16:
+        x = x.to(torch.float32)
+    return np.asarray(x)
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,34 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     """
 
     config: OpenPi0Config
+
+    def _paligemma_language_dtype(self) -> torch.dtype:
+        return self.paligemma_with_expert.paligemma.language_model.layers[
+            0
+        ].self_attn.q_proj.weight.dtype
+
+    def _gemma_expert_dtype(self) -> torch.dtype:
+        return self.paligemma_with_expert.gemma_expert.model.layers[
+            0
+        ].self_attn.q_proj.weight.dtype
+
+    def _projection_autocast(self, device: torch.device, dtype: torch.dtype):
+        if device.type == "cuda" and dtype in (torch.bfloat16, torch.float16):
+            return torch.autocast(device_type=device.type, dtype=dtype)
+        return nullcontext()
+
+    def _fork_past_key_values(self, past_key_values):
+        if past_key_values is None:
+            return None
+
+        forked_cache = copy.copy(past_key_values)
+        if hasattr(past_key_values, "key_cache"):
+            forked_cache.key_cache = list(past_key_values.key_cache)
+        if hasattr(past_key_values, "value_cache"):
+            forked_cache.value_cache = list(past_key_values.value_cache)
+        if hasattr(past_key_values, "_seen_tokens"):
+            forked_cache._seen_tokens = past_key_values._seen_tokens
+        return forked_cache
 
     @property
     def _no_split_modules(self) -> list[str]:
@@ -824,7 +859,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         elif sample_method == "flow_noise":
             x0_weight = 1 - (t_input - delta)
             x1_weight = t_input - delta
-            x_t_std = self.noise_head(suffix_out)
+            expert_dtype = self._gemma_expert_dtype()
+            with self._projection_autocast(suffix_out.device, expert_dtype):
+                x_t_std = self.noise_head(suffix_out.to(dtype=expert_dtype))
+            x_t_std = x_t_std.to(dtype=torch.float32)
         else:
             raise ValueError(f"Invalid noise method: {sample_method}")
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
@@ -839,9 +877,18 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
-            self.embed_suffix(state, x_t, timestep)
-        )
+        expert_dtype = self._gemma_expert_dtype()
+        x_t = x_t.to(dtype=expert_dtype)
+        timestep = timestep.to(dtype=expert_dtype)
+        state = state.to(dtype=expert_dtype)
+
+        with self._projection_autocast(x_t.device, expert_dtype):
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+                self.embed_suffix(state, x_t, timestep)
+            )
+        suffix_embs = suffix_embs.to(dtype=expert_dtype)
+        if torch.is_tensor(adarms_cond):
+            adarms_cond = adarms_cond.to(dtype=expert_dtype)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -863,11 +910,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
             "eager"  # noqa: SLF001
         )
+        suffix_past_key_values = self._fork_past_key_values(past_key_values)
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            past_key_values=suffix_past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
@@ -883,7 +931,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         suffix_out = self.get_suffix_out(
             state, prefix_pad_masks, past_key_values, x_t, timestep
         )
-        v_t = self.action_out_proj(suffix_out)
+        expert_dtype = self._gemma_expert_dtype()
+        with self._projection_autocast(suffix_out.device, expert_dtype):
+            v_t = self.action_out_proj(suffix_out.to(dtype=expert_dtype))
+        v_t = v_t.to(dtype=torch.float32)
         return v_t, suffix_out
 
     def _build_prefix_cache(self, images, img_masks, lang_tokens, lang_masks):
@@ -891,6 +942,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
+        prefix_embs = prefix_embs.to(dtype=self._paligemma_language_dtype())
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
@@ -914,7 +966,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             suffix_out_value = torch.mean(suffix_out, dim=1, keepdim=False)
         if self.config.detach_critic_input:
             suffix_out_value = suffix_out_value.detach()
-        return self.value_head(suffix_out_value)[:, 0]
+        expert_dtype = self._gemma_expert_dtype()
+        with self._projection_autocast(suffix_out_value.device, expert_dtype):
+            value = self.value_head(suffix_out_value.to(dtype=expert_dtype))
+        return value[:, 0].to(dtype=torch.float32)
 
     # TODO: to check potential nan here
     def get_logprob_norm(self, sample, mu, sigma):
@@ -1025,8 +1080,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_out_value = prefix_output[:, prefix_mask, :]
         prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
         prefix_out_value = prefix_out_value.to(dtype=torch.float32)
-        values_vlm = self.value_head(prefix_out_value)[:, 0]
-        return values_vlm
+        expert_dtype = self._gemma_expert_dtype()
+        with self._projection_autocast(prefix_out_value.device, expert_dtype):
+            values_vlm = self.value_head(prefix_out_value.to(dtype=expert_dtype))[:, 0]
+        return values_vlm.to(dtype=torch.float32)
 
     def gaussian_entropy(self, sigma):
         mask = sigma == 0

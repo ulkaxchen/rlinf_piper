@@ -284,6 +284,25 @@ class Channel:
         """Check if the channel is a local channel."""
         return self._local_channel is not None
 
+    def close(self) -> None:
+        """Close this channel and release its worker processes.
+
+        Any queued items are discarded. Callers must make sure all producers and
+        consumers have completed before closing a distributed channel.
+        """
+        if self._local_channel is not None:
+            Channel.local_channel_map.pop(self._local_channel_id, None)
+            self._local_channel = None
+            return
+        if self._channel_worker_group is None:
+            return
+
+        self._channel_worker_group._close()
+        self._channel_worker_group = None
+        self._main_channel_worker_actor = None
+        self._channel_actors_by_rank.clear()
+        self._key_to_channel_rank_cache.clear()
+
     def _get_src_node_rank(self) -> int:
         """Return the caller's cluster node rank if available."""
         if self._current_worker is not None:

@@ -37,11 +37,13 @@ that metric, so training rollout length is controlled by truncation
 (``max_episode_steps``).
 """
 
+import gc
 import io
 import json
 import os
 import sys
 from contextlib import nullcontext
+from types import MethodType
 from typing import Optional, Union
 
 import numpy as np
@@ -56,6 +58,24 @@ __all__ = ["DreamDojoEnv"]
 
 
 _COSMOS_RESOLVER_PATCHED = False
+
+
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _trim_host_allocator():
+    """Return freed glibc heap pages to the OS when available."""
+    try:
+        import ctypes
+
+        malloc_trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim(0)
+    except (AttributeError, OSError):
+        pass
 
 
 def _patch_omegaconf_resolvers():
@@ -124,10 +144,29 @@ class DreamDojoEnv(BaseWorldEnv):
         self.guidance = cfg.get("guidance", 0)
         self.gen_height = cfg.get("height", 1440)
         self.gen_width = cfg.get("width", 640)
-        self.num_latent_conditional_frames = cfg.get(
-            "num_latent_conditional_frames", 1
-        )
+        self.num_latent_conditional_frames = cfg.get("num_latent_conditional_frames", 1)
         self.seed_base = self.seed
+        self.text_embedding_cache_path = cfg.get("text_embedding_cache_path", None)
+        self.negative_text_embedding_cache_path = cfg.get(
+            "negative_text_embedding_cache_path", None
+        )
+        self.disable_online_text_encoder = _as_bool(
+            cfg.get(
+                "disable_online_text_encoder",
+                self.text_embedding_cache_path is not None,
+            )
+        )
+        self.dreamdojo_backend = str(
+            cfg.get("dreamdojo_backend", "video2world")
+        ).lower()
+        if self.dreamdojo_backend not in ("video2world", "distilled_student"):
+            raise ValueError(
+                "dreamdojo_backend must be 'video2world' or 'distilled_student', "
+                f"got {self.dreamdojo_backend!r}"
+            )
+        self.cr1_embeddings_path = cfg.get(
+            "cr1_embeddings_path", self.text_embedding_cache_path
+        )
 
         # Action layout inside the 384-wide cosmos action vector.
         self.model_action_dim = cfg.get("model_action_dim", 384)
@@ -183,6 +222,10 @@ class DreamDojoEnv(BaseWorldEnv):
         # it with the final action of the actual env action chunk.
         self.current_states = None
         self._last_action_state = None
+        # The student environment uses this to load a matching demonstration
+        # action prefix during its reset-time streaming warmup. Teacher rollout
+        # behavior is unchanged.
+        self._last_reset_episode_indices = None
         # All frames generated in the last chunk_step, kept for per-frame reward
         # scoring at native resolution, CHW: uint8 [num_envs, gen_frames, 3, H, W].
         self.last_chunk_frames = None
@@ -238,11 +281,100 @@ class DreamDojoEnv(BaseWorldEnv):
             sys.path.insert(0, str(repo_path))
         _patch_omegaconf_resolvers()
 
+    def _validate_distilled_student_inputs(self):
+        config_file = str(self.cfg.config_file)
+        if "interactive/configs/" not in config_file:
+            raise ValueError(
+                "dreamdojo_backend='distilled_student' must use DreamDojo's "
+                "interactive config, e.g. "
+                "cosmos_predict2/_src/predict2/interactive/configs/config_distill.py. "
+                f"Got config_file={config_file!r}."
+            )
+
+        experiment = str(self.cfg.experiment)
+        if experiment == "dreamdojo_2b_1440_640_piper":
+            raise ValueError(
+                "dreamdojo_2b_1440_640_piper is the Piper teacher experiment "
+                "registered by the action-conditioned config. The distilled "
+                "student backend needs an interactive/self-forcing experiment "
+                "registered under DreamDojo's interactive configs."
+            )
+
+        ckpt_path = str(self.cfg.dreamdojo_ckpt_path)
+        if ckpt_path.endswith(".pt"):
+            raise ValueError(
+                "dreamdojo_backend='distilled_student' expects a DCP checkpoint "
+                "directory whose child 'model/' contains distcp shards, not a "
+                f"single .pt file: {ckpt_path}"
+            )
+        if not ckpt_path.startswith(("s3://", "msc://")):
+            model_dir = os.path.join(os.path.expanduser(ckpt_path), "model")
+            if not os.path.isdir(model_dir):
+                raise FileNotFoundError(
+                    "dreamdojo_backend='distilled_student' expects "
+                    f"{model_dir} to exist. Pass the checkpoint root directory "
+                    "such as checkpoints/self_forcing/.../iter_000010000, not "
+                    "the teacher model_ema_bf16.pt file."
+                )
+
     def _build_pipeline(self):
         self._ensure_dreamdojo_on_path()
+
+        if self.dreamdojo_backend == "distilled_student":
+            from cosmos_predict2._src.predict2.interactive.inference.action_video2world import (
+                ActionStreamingInference,
+            )
+
+            self._validate_distilled_student_inputs()
+            cr1_embeddings_path = self.cr1_embeddings_path
+            if cr1_embeddings_path in (None, "", "null"):
+                raise ValueError(
+                    "dreamdojo_backend='distilled_student' requires "
+                    "cr1_embeddings_path or text_embedding_cache_path."
+                )
+
+            return ActionStreamingInference(
+                config_path=self.cfg.config_file,
+                experiment_name=self.cfg.experiment,
+                ckpt_path=self.cfg.dreamdojo_ckpt_path,
+                s3_credential_path=self.cfg.get(
+                    "s3_credential_path", "credentials/s3_checkpoint.secret"
+                ),
+                cr1_embeddings_path=cr1_embeddings_path,
+                context_parallel_size=int(
+                    self.cfg.get("dreamdojo_context_parallel_size", 1)
+                ),
+                enable_fsdp=_as_bool(self.cfg.get("dreamdojo_enable_fsdp", False)),
+                torch_compile=_as_bool(self.cfg.get("dreamdojo_torch_compile", False)),
+            )
+
         from cosmos_predict2._src.predict2.inference.video2world import (
             Video2WorldInference,
         )
+
+        experiment_opts = []
+        if self.disable_online_text_encoder:
+            if self.text_embedding_cache_path is None:
+                raise ValueError(
+                    "disable_online_text_encoder=True requires "
+                    "text_embedding_cache_path."
+                )
+            for path_name, path in (
+                ("text_embedding_cache_path", self.text_embedding_cache_path),
+                (
+                    "negative_text_embedding_cache_path",
+                    self.negative_text_embedding_cache_path,
+                ),
+            ):
+                if path is not None and not os.path.isfile(
+                    os.path.expanduser(str(path))
+                ):
+                    raise FileNotFoundError(
+                        f"Configured {path_name} does not exist: {path}"
+                    )
+            experiment_opts.append(
+                "model.config.text_encoder_config.compute_online=False"
+            )
 
         pipe = Video2WorldInference(
             experiment_name=self.cfg.experiment,
@@ -250,8 +382,185 @@ class DreamDojoEnv(BaseWorldEnv):
             s3_credential_path="",
             context_parallel_size=1,
             config_file=self.cfg.config_file,
+            experiment_opts=experiment_opts,
         )
+        if self.text_embedding_cache_path is not None:
+            self._install_cached_text_embedding_hook(pipe)
         return pipe
+
+    def _generate_chunk_video(self, vid_input, model_action, num_video_frames, seed):
+        if self.dreamdojo_backend == "distilled_student":
+            # ActionStreamingInference consumes an in-memory video array shaped
+            # [T, H, W, C] or [B, T, H, W, C] and only uses start_frame_idx as the
+            # conditioning frame. Keep just the current frame to avoid passing
+            # the zero padding tail used by the standard Video2World path.
+            first_frame = (
+                vid_input[0, :, 0]
+                .permute(1, 2, 0)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.uint8)
+            )
+            video = self.pipe.generate_action_streaming(
+                video_path=first_frame[None],
+                actions_np=model_action.detach().cpu().numpy(),
+                resolution_hw=(self.gen_height, self.gen_width),
+                num_steps=self.num_inference_steps,
+                seed=seed,
+                start_frame_idx=0,
+                max_frames=num_video_frames,
+            )
+            return video
+
+        return self.pipe.generate_vid2world(
+            prompt="",
+            input_path=vid_input,
+            action=model_action,
+            guidance=self.guidance,
+            num_video_frames=num_video_frames,
+            num_latent_conditional_frames=self.num_latent_conditional_frames,
+            resolution="none",
+            seed=seed,
+            negative_prompt=self._negative_prompt,
+            num_steps=self.num_inference_steps,
+            lam_video=None,
+        )
+
+    def _load_cached_text_embedding(self, path, name: str):
+        """Load a cached DreamDojo/Reason1 text embedding tensor.
+
+        The canonical Cosmos cache is a bf16 tensor with shape
+        ``[1, 512, 100352]``. Dict checkpoints are accepted as long as they
+        contain a common embedding key.
+        """
+        if path is None:
+            return None
+        path = os.path.expanduser(str(path))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Configured {name} text embedding cache does not exist: {path}"
+            )
+
+        payload = torch.load(path, map_location="cpu")
+        if isinstance(payload, dict):
+            for key in (
+                name,
+                "text_embeddings",
+                "t5_text_embeddings",
+                "embedding",
+                "embeddings",
+            ):
+                if key in payload:
+                    payload = payload[key]
+                    break
+            else:
+                raise KeyError(
+                    f"{path} is a dict but contains no cached text embedding key"
+                )
+        if not isinstance(payload, torch.Tensor):
+            raise TypeError(
+                f"{path} must contain a torch.Tensor, got {type(payload).__name__}"
+            )
+        if payload.ndim == 2:
+            payload = payload.unsqueeze(0)
+        if payload.ndim != 3:
+            raise ValueError(
+                f"{path} must have shape [B, seq, dim] or [seq, dim], "
+                f"got {tuple(payload.shape)}"
+            )
+        return payload.contiguous()
+
+    def _install_cached_text_embedding_hook(self, pipe):
+        """Patch DreamDojo inference to use cached text embeddings.
+
+        Disabling ``compute_online`` prevents the 7B Reason1 encoder from being
+        constructed. DreamDojo's default inference path would then fall back to a
+        T5 embedding with the wrong channel size for this checkpoint, so we
+        inject the cached Reason1 embeddings directly into the data batch.
+        """
+        cached_text = self._load_cached_text_embedding(
+            self.text_embedding_cache_path, "t5_text_embeddings"
+        )
+        if self.negative_text_embedding_cache_path is None:
+            cached_negative = cached_text
+        elif os.path.abspath(
+            str(self.negative_text_embedding_cache_path)
+        ) == os.path.abspath(str(self.text_embedding_cache_path)):
+            cached_negative = cached_text
+        else:
+            cached_negative = self._load_cached_text_embedding(
+                self.negative_text_embedding_cache_path,
+                "neg_t5_text_embeddings",
+            )
+
+        expected_dim = getattr(
+            pipe.model.config.net, "crossattn_proj_in_channels", None
+        )
+        for name, embedding in (
+            ("t5_text_embeddings", cached_text),
+            ("neg_t5_text_embeddings", cached_negative),
+        ):
+            if expected_dim is not None and embedding.shape[-1] != expected_dim:
+                raise ValueError(
+                    f"{name} cache has dim {embedding.shape[-1]}, but DreamDojo "
+                    f"expects crossattn_proj_in_channels={expected_dim}."
+                )
+
+        def _cached_get_data_batch_input(
+            pipe_self,
+            video: torch.Tensor,
+            prompt: str,
+            num_conditional_frames: int = 1,
+            negative_prompt: str = "",
+            use_neg_prompt: bool = True,
+            camera: torch.Tensor | None = None,
+            action: torch.Tensor | None = None,
+            lam_video: torch.Tensor | None = None,
+        ):
+            del prompt, negative_prompt
+            batch_size, _, _, height, width = video.shape
+
+            text = cached_text
+            if text.shape[0] == 1 and batch_size != 1:
+                text = text.expand(batch_size, -1, -1)
+            elif text.shape[0] != batch_size:
+                raise ValueError(
+                    "Cached t5_text_embeddings batch dimension "
+                    f"{text.shape[0]} does not match video batch {batch_size}."
+                )
+            neg_text = cached_negative
+            if neg_text.shape[0] == 1 and batch_size != 1:
+                neg_text = neg_text.expand(batch_size, -1, -1)
+            elif neg_text.shape[0] != batch_size:
+                raise ValueError(
+                    "Cached neg_t5_text_embeddings batch dimension "
+                    f"{neg_text.shape[0]} does not match video batch {batch_size}."
+                )
+
+            data_batch = {
+                "dataset_name": "video_data",
+                "video": video,
+                "camera": camera,
+                "action": action.unsqueeze(0) if action is not None else None,
+                "fps": torch.randint(16, 32, (batch_size,)).float(),
+                "padding_mask": torch.zeros(batch_size, 1, height, width),
+                "num_conditional_frames": num_conditional_frames,
+                "lam_video": (
+                    lam_video.unsqueeze(0) if lam_video is not None else None
+                ),
+                "t5_text_embeddings": text,
+            }
+            if use_neg_prompt:
+                data_batch["neg_t5_text_embeddings"] = neg_text
+
+            for key, value in data_batch.items():
+                if isinstance(value, torch.Tensor) and torch.is_floating_point(value):
+                    data_batch[key] = value.cuda().to(dtype=torch.bfloat16)
+
+            return data_batch
+
+        pipe._get_data_batch_input = MethodType(_cached_get_data_batch_input, pipe)
 
     def _load_reward_model(self):
         """Build the per-frame reward model from cfg.reward_model.
@@ -326,6 +635,9 @@ class DreamDojoEnv(BaseWorldEnv):
             )
         elif isinstance(episode_indices, torch.Tensor):
             episode_indices = episode_indices.cpu().numpy()
+        self._last_reset_episode_indices = np.asarray(
+            episode_indices, dtype=np.int64
+        ).copy()
 
         frames = []  # list of uint8 [H, W, 3]
         task_descriptions = []
@@ -395,9 +707,7 @@ class DreamDojoEnv(BaseWorldEnv):
             env_action = torch.from_numpy(env_action)
         env_action = env_action.float()
         chunk = env_action.shape[0]
-        model_action = torch.zeros(
-            chunk, self.model_action_dim, dtype=torch.float32
-        )
+        model_action = torch.zeros(chunk, self.model_action_dim, dtype=torch.float32)
         model_action[:, self.action_slot_start : self.action_slot_end] = env_action[
             :, : self.piper_action_dim
         ]
@@ -491,9 +801,7 @@ class DreamDojoEnv(BaseWorldEnv):
             states = states.detach().to(dtype=actions.dtype, device=actions.device)
             states = states[:, : self.piper_action_dim]
             if states.shape[-1] < self.piper_action_dim:
-                states = F.pad(
-                    states, (0, self.piper_action_dim - states.shape[-1])
-                )
+                states = F.pad(states, (0, self.piper_action_dim - states.shape[-1]))
 
         abs_actions = actions[..., : self.piper_action_dim]
         # Normalize absolute joint angles into DreamDojo's training space *before*
@@ -558,18 +866,11 @@ class DreamDojoEnv(BaseWorldEnv):
 
             model_action = self._build_model_action(actions[env_idx])
 
-            video = self.pipe.generate_vid2world(
-                prompt="",
-                input_path=vid_input,
-                action=model_action,
-                guidance=self.guidance,
+            video = self._generate_chunk_video(
+                vid_input=vid_input,
+                model_action=model_action,
                 num_video_frames=num_video_frames,
-                num_latent_conditional_frames=self.num_latent_conditional_frames,
-                resolution="none",
                 seed=self.seed_base + self.elapsed_steps + env_idx,
-                negative_prompt=self._negative_prompt,
-                num_steps=self.num_inference_steps,
-                lam_video=None,
             )
             # video: [1, 3, T, H, W] in [-1, 1]. Frame 0 is the conditioning
             # frame; frames [1:] are the gen_frames predictions.
@@ -643,9 +944,7 @@ class DreamDojoEnv(BaseWorldEnv):
         if tuple(image.shape[1:3]) == self.image_size:
             return image
         x = image.permute(0, 3, 1, 2).float()  # [N, 3, H, W]
-        x = F.interpolate(
-            x, size=self.image_size, mode="bilinear", align_corners=False
-        )
+        x = F.interpolate(x, size=self.image_size, mode="bilinear", align_corners=False)
         return x.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)
 
     def get_video_frame_batches(self):
@@ -675,8 +974,7 @@ class DreamDojoEnv(BaseWorldEnv):
         if n_views > 1:
             height = full_image.shape[1]
             assert height % n_views == 0, (
-                f"generated height {height} not divisible by num_camera_views "
-                f"{n_views}"
+                f"generated height {height} not divisible by num_camera_views {n_views}"
             )
             vh = height // n_views
             views = [
@@ -772,7 +1070,9 @@ class DreamDojoEnv(BaseWorldEnv):
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
         if past_dones.any() and self.auto_reset:
-            extracted_obs, infos = self._handle_auto_reset(past_dones, extracted_obs, {})
+            extracted_obs, infos = self._handle_auto_reset(
+                past_dones, extracted_obs, {}
+            )
         else:
             infos = {}
 
@@ -796,14 +1096,32 @@ class DreamDojoEnv(BaseWorldEnv):
     # ------------------------------------------------------------------
     # Offload / state (for RLinf memory management)
     # ------------------------------------------------------------------
+    def _move_pipe_module(self, owner, attr: str, device):
+        module = getattr(owner, attr, None)
+        if module is not None and hasattr(module, "to"):
+            try:
+                setattr(owner, attr, module.to(device))
+            except Exception:
+                pass
+
     def _move_pipe(self, device):
+        if self.pipe is None:
+            return
         for attr in ("dit", "net", "model", "vae", "tokenizer", "text_encoder"):
-            module = getattr(self.pipe, attr, None)
-            if module is not None and hasattr(module, "to"):
-                try:
-                    setattr(self.pipe, attr, module.to(device))
-                except Exception:
-                    pass
+            self._move_pipe_module(self.pipe, attr, device)
+
+        model = getattr(self.pipe, "model", None)
+        if model is None:
+            return
+        for attr in ("net", "conditioner", "lam"):
+            self._move_pipe_module(model, attr, device)
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer is not None:
+            for attr in ("encoder", "decoder"):
+                self._move_pipe_module(tokenizer, attr, device)
+        text_encoder = getattr(model, "text_encoder", None)
+        if text_encoder is not None:
+            self._move_pipe_module(text_encoder, "model", device)
 
     def offload(self):
         if self._is_offloaded:
@@ -825,7 +1143,39 @@ class DreamDojoEnv(BaseWorldEnv):
         self._clear_accelerator_cache()
         self._is_offloaded = True
 
+    def unload(self):
+        """Release the inactive DreamDojo pipeline between RL updates.
+
+        ``offload()`` is intentionally lightweight: it moves the world model
+        from GPU to CPU so VLA and world-model phases can alternate within one
+        rollout.  On a small single-GPU host, retaining that complete CPU copy
+        while the actor prepares and trains a GRPO batch can still exhaust RAM.
+        This slower path is only invoked after the full rollout has been sent
+        to the actor; ``onload()`` rebuilds the pipeline before the next env
+        step without changing rollout state.
+        """
+        self.offload()
+        if self.pipe is None:
+            return
+
+        pipe = self.pipe
+        self.pipe = None
+        cleanup = getattr(pipe, "cleanup", None)
+        try:
+            if callable(cleanup):
+                cleanup()
+        finally:
+            # A bound cleanup method keeps ``pipe`` alive through ``__self__``.
+            # Drop it before collecting or the model weights remain resident.
+            del cleanup
+            del pipe
+            gc.collect()
+            _trim_host_allocator()
+            self._clear_accelerator_cache()
+
     def onload(self):
+        if self.pipe is None:
+            self.pipe = self._build_pipeline()
         if not self._is_offloaded:
             return
         self._move_pipe(self.device)
@@ -887,7 +1237,7 @@ if __name__ == "__main__":
     config_dir = Path(
         os.environ.get("EMBODIED_CONFIG_DIR", repo_root / "examples/embodiment/config")
     ).resolve()
-    config_name = os.environ.get("DREAMDOJO_CONFIG", "dreamdojo_piper_grpo")
+    config_name = os.environ.get("DREAMDOJO_CONFIG", "dreamdojo_piper_teacher_grpo")
 
     print(f"Loading config: {config_name} from {config_dir}")
     with initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):

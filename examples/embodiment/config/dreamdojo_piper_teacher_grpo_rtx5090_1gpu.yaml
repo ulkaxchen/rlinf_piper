@@ -1,0 +1,43 @@
+defaults:
+  - dreamdojo_piper_teacher_grpo
+  - _self_
+
+# One RTX 5090 runs rollout, the frozen teacher, and actor training serially.
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0
+
+runner:
+  logger:
+    experiment_name: "dreamdojo_piper_teacher_grpo_rtx5090_1gpu"
+    logger_backends: []
+  single_gpu_serial_offload: True
+  single_gpu_serial_unload_env: True
+  single_gpu_serial_lazy_actor_init: True
+
+env:
+  train:
+    total_num_envs: 2
+    enable_offload: True
+    video_cfg:
+      save_video: False
+  eval:
+    total_num_envs: 1
+    enable_offload: True
+    video_cfg:
+      save_video: False
+
+rollout:
+  enable_offload: True
+
+actor:
+  micro_batch_size: 1
+  global_batch_size: 2
+  enable_offload: True
+  model:
+    precision: bf16
+  fsdp_config:
+    sharding_strategy: "no_shard"
+    save_full_model_weights: False
+    gradient_checkpointing: False

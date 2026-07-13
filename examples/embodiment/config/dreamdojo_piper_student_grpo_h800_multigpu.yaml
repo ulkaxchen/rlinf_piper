@@ -1,0 +1,46 @@
+defaults:
+  - dreamdojo_piper_student_grpo
+  - _self_
+
+# Single-node data parallelism on 2, 4, or 8 visible H800 GPUs. Each GPU hosts
+# one actor, rollout, and frozen DreamDojo student process; the world model is
+# replicated rather than sharded across GPUs.
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  logger:
+    experiment_name: "dreamdojo_piper_student_grpo_h800_multigpu"
+  single_gpu_serial_offload: False
+  single_gpu_serial_unload_env: False
+  single_gpu_serial_lazy_actor_init: False
+
+env:
+  train:
+    total_num_envs: 16
+    enable_offload: True
+    # H800 has enough VRAM to retain the DCP pipeline between GRPO steps and to
+    # decode without moving the 2B DiT to CPU before every latent.
+    student_unload_on_offload: False
+    student_decode_dit_offload: False
+  eval:
+    total_num_envs: 8
+    enable_offload: True
+    student_unload_on_offload: False
+    student_decode_dit_offload: False
+
+rollout:
+  enable_offload: True
+  pipeline_stage_num: 1
+
+actor:
+  # 512 rollout samples / 256 = two optimizer minibatches per GRPO step.
+  micro_batch_size: 8
+  global_batch_size: 256
+  enable_offload: True
+  fsdp_config:
+    sharding_strategy: "no_shard"
+    save_full_model_weights: False
+    gradient_checkpointing: False

@@ -19,7 +19,7 @@ from hydra.core.global_hydra import GlobalHydra
 from dreamdojo_venv_compat import ensure_scheduler_worker
 
 Worker = ensure_scheduler_worker()
-from rlinf.envs.world_model.world_model_dreamdojo_env import DreamDojoEnv
+from rlinf.envs.world_model.world_model_dreamdojo_env import DreamDojoEnv  # noqa: E402
 
 
 def _parse_args():
@@ -28,7 +28,7 @@ def _parse_args():
         "--config-dir",
         default="/project/peilab/srk/wmpo_workspace/RLinf/examples/embodiment/config",
     )
-    parser.add_argument("--config-name", default="dreamdojo_piper_grpo")
+    parser.add_argument("--config-name", default="dreamdojo_piper_teacher_grpo")
     parser.add_argument(
         "--dataset-path",
         default="/project/peilab/srk/wmpo_workspace/piper_data/insert-mouse-battery/piper_insert_mouse_battery_lerobot",
@@ -149,7 +149,9 @@ def main():
     _write_video(out_dir / "pred.mp4", pred_video, args.fps)
     _write_video(out_dir / "gt.mp4", gt_video, args.fps)
     _write_video(out_dir / "merged_gt_left_pred_right.mp4", merged_video, args.fps)
-    np.savez_compressed(out_dir / "frames.npz", pred=pred_video, gt=gt_video, merged=merged_video)
+    np.savez_compressed(
+        out_dir / "frames.npz", pred=pred_video, gt=gt_video, merged=merged_video
+    )
 
     summary = {
         "index": args.index,

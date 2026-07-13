@@ -14,9 +14,73 @@
 # openpi model configs
 
 import os
+from types import MethodType
 
 import torch
 from omegaconf import DictConfig
+
+
+def _patch_siglip_vision_dtype_compat(model: torch.nn.Module) -> None:
+    """Keep OpenPI SigLIP activations aligned with mixed precision params."""
+    paligemma = getattr(
+        getattr(model, "paligemma_with_expert", None), "paligemma", None
+    )
+    paligemma_model = getattr(paligemma, "model", None)
+    vision_tower = getattr(paligemma_model, "vision_tower", None)
+    vision_model = getattr(vision_tower, "vision_model", None)
+    if vision_model is None or getattr(vision_model, "_rlinf_dtype_compat", False):
+        return
+
+    from transformers.modeling_outputs import BaseModelOutputWithPooling
+
+    def forward_with_dtype_compat(
+        self,
+        pixel_values,
+        output_attentions=None,
+        output_hidden_states=None,
+        interpolate_pos_encoding=False,
+    ):
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+
+        patch_embedding = getattr(self.embeddings, "patch_embedding", None)
+        if patch_embedding is not None:
+            pixel_values = pixel_values.to(dtype=patch_embedding.weight.dtype)
+
+        hidden_states = self.embeddings(
+            pixel_values, interpolate_pos_encoding=interpolate_pos_encoding
+        )
+
+        encoder_dtype = self.encoder.layers[0].self_attn.q_proj.weight.dtype
+        if hidden_states.dtype != encoder_dtype:
+            hidden_states = hidden_states.to(dtype=encoder_dtype)
+
+        encoder_outputs = self.encoder(
+            inputs_embeds=hidden_states,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+        )
+
+        last_hidden_state = self.post_layernorm(encoder_outputs.last_hidden_state)
+        pooler_output = self.head(last_hidden_state) if self.use_head else None
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=pooler_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
+    vision_model.forward = MethodType(forward_with_dtype_compat, vision_model)
+    vision_model._rlinf_dtype_compat = True
 
 
 def get_model(cfg: DictConfig, torch_dtype=None):
@@ -87,6 +151,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         model.load_state_dict(all_state_dict, strict=False)
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    _patch_siglip_vision_dtype_compat(model)
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats

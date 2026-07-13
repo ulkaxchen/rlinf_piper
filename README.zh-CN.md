@@ -29,6 +29,7 @@ RLinf 是一个灵活且可扩展的开源框架，专为具身智能和智能�
 </div>
 
 ## 最新动态
+- [2026/07] 🔥 RLinf 现已支持使用蒸馏后的 [DreamDojo](https://github.com/NVIDIA/DreamDojo) 流式世界模型，在单张 GPU 上通过 GRPO 微调 pi0.5。文档：[使用 DreamDojo Student 进行强化学习](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/dreamdojo_student.html)。
 - [2026/06] 🔥 RLinf 现在已经支持强化学习微调 [GR00T-N1.7](https://github.com/NVIDIA/Isaac-GR00T)！文档：[RL on GR00T-N1.7](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/gr00t.html)。
 - [2026/06] 🔥 RLinf 支持基于 Polaris 模拟器的强化学习微调。文档：[Polaris 强化学习训练](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/polaris.html)。
 - [2026/06] 🔥 RLinf 现在已经支持强化学习微调 [GR00T-N1.6](https://github.com/NVIDIA/Isaac-GR00T)！文档：[RL on GR00T-N1.6](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/gr00t.html)。
@@ -161,6 +162,7 @@ RLinf 支持 World Action Model（WAM）和 Vision-Language-Action Model（VLA�
           </ul>
           <ul>
             <li><a href="https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/wan.html">Wan</a> ✅</li>
+            <li><a href="https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/dreamdojo_student.html">DreamDojo Student</a> ✅</li>
           </ul>
           <li><b>自定义模型</b></li>
           <ul>

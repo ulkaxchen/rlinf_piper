@@ -110,6 +110,17 @@
        </p>
      </div>
 
+     <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+       <img src="https://raw.githubusercontent.com/NVIDIA/DreamDojo/main/assets/banner.gif"
+            style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);">
+       <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
+         <a href="embodied/dreamdojo_student.html" style="text-decoration: underline; color: blue;">
+           <b>基于 DreamDojo Teacher 和 Student 的强化学习</b>
+         </a><br>
+         在单张 RTX 5090 或多张 H800 上运行 teacher/student GRPO
+       </p>
+     </div>
+
    </div>
 
 .. toctree::
@@ -125,3 +136,4 @@
    ABot-M0 <embodied/abot_m0>
    OpenSora <embodied/opensora>
    Wan <embodied/wan>
+   DreamDojo <embodied/dreamdojo_student>

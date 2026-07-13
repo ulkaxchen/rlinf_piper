@@ -1979,7 +1979,7 @@ install_dreamdojo_world_model() {
     # 1) Build the cosmos-native venv (torch 2.7 cu128 + cosmos-oss heavy deps)
     #    at $VENV_DIR. UV_PROJECT_ENVIRONMENT redirects the workspace venv there
     #    instead of <dreamdojo_dir>/.venv.
-    ( cd "$dreamdojo_dir" && UV_PROJECT_ENVIRONMENT="$VENV_DIR" uv sync --extra cu128 )
+    ( cd "$dreamdojo_dir" && UV_PROJECT_ENVIRONMENT="$VENV_DIR" uv sync --python "$PYTHON_VERSION" --extra cu128 )
 
     # Activate it so the shared helpers (uv pip install, install_flash_attn) and
     # the trailing pynvml cleanup target this venv.

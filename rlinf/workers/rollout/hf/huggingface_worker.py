@@ -31,6 +31,10 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.serial_checkpoint import (
+    load_trainable_model_state,
+    trim_host_allocator,
+)
 
 
 class MultiStepRolloutWorker(Worker):
@@ -52,6 +56,9 @@ class MultiStepRolloutWorker(Worker):
 
         self.num_pipeline_stages = cfg.rollout.pipeline_stage_num
         self.enable_offload = self.cfg.rollout.get("enable_offload", False)
+        self.single_gpu_serial_offload = bool(
+            self.cfg.runner.get("single_gpu_serial_offload", False)
+        )
 
         self.placement = HybridComponentPlacement(cfg, Cluster())
 
@@ -71,6 +78,7 @@ class MultiStepRolloutWorker(Worker):
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.expert_model = None
+        self._serial_model_released = False
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -118,17 +126,21 @@ class MultiStepRolloutWorker(Worker):
             self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
             self._sync_weight_comm_options = self.weight_syncer.comm_options
 
-    def init_worker(self):
+    def _build_rollout_model(self) -> BasePolicy:
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
-        self.hf_model: BasePolicy = get_model(rollout_model_config)
+        model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
-            self.hf_model.load_state_dict(model_dict)
+            model.load_state_dict(model_dict)
+        return model
+
+    def init_worker(self):
+        self.hf_model = self._build_rollout_model()
 
         if self.cfg.rollout.get("expert_model", None):
             expert_model_config = copy.deepcopy(self.model_cfg)
@@ -184,6 +196,27 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+    def release_serial_model(self) -> None:
+        """Release the rollout model before constructing the training actor."""
+        if self._serial_model_released:
+            return
+        if self.enable_offload:
+            self.offload_model()
+        del self.hf_model
+        self._serial_model_released = True
+        trim_host_allocator()
+        self.torch_platform.empty_cache()
+
+    def restore_serial_model(self, checkpoint_path: str) -> None:
+        """Rebuild the rollout model and stream updated weights into it."""
+        if self._serial_model_released:
+            self.hf_model = self._build_rollout_model()
+        load_trainable_model_state(self.hf_model, checkpoint_path)
+        self.hf_model.eval()
+        if self.enable_offload:
+            self.offload_model()
+        self._serial_model_released = False
 
     def setup_sample_params(self):
         # sampling parameters for rollout
@@ -427,47 +460,61 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
+                if self.single_gpu_serial_offload and self.enable_offload:
+                    self.reload_model()
+                try:
+                    actions, result = self.predict(env_output["obs"])
+
+                    save_flags = None
+                    if result.get("expert_label_flag", False):
+                        save_flags = torch.full(
+                            (actions.shape[0], self.model_cfg.num_action_chunks),
+                            True,
+                            dtype=torch.bool,
+                            device=actions.device,
+                        )
+                    rollout_result = RolloutResult(
+                        actions=actions,
+                        prev_logprobs=result["prev_logprobs"]
+                        if self.collect_prev_infos
+                        else None,
+                        prev_values=result["prev_values"]
+                        if self.collect_prev_infos
+                        else None,
+                        bootstrap_values=self.get_bootstrap_values(
+                            env_output.get("final_obs", None)
+                        ),
+                        save_flags=save_flags,
+                        forward_inputs=result["forward_inputs"],
+                        versions=torch.full_like(
+                            result["prev_logprobs"],
+                            float(self.version),
+                            dtype=torch.float32,
+                        ),
+                    )
+                finally:
+                    if self.single_gpu_serial_offload and self.enable_offload:
+                        self.offload_model()
+                self.send_rollout_result(output_channel, rollout_result, mode="train")
+        for _ in range(self.num_pipeline_stages):
+            env_output = await self.recv_env_output(input_channel)
+            if self.single_gpu_serial_offload and self.enable_offload:
+                self.reload_model()
+            try:
                 actions, result = self.predict(env_output["obs"])
 
-                save_flags = None
-                if result.get("expert_label_flag", False):
-                    save_flags = torch.full(
-                        (actions.shape[0], self.model_cfg.num_action_chunks),
-                        True,
-                        dtype=torch.bool,
-                        device=actions.device,
-                    )
                 rollout_result = RolloutResult(
                     actions=actions,
-                    prev_logprobs=result["prev_logprobs"]
-                    if self.collect_prev_infos
-                    else None,
                     prev_values=result["prev_values"]
                     if self.collect_prev_infos
                     else None,
                     bootstrap_values=self.get_bootstrap_values(
                         env_output.get("final_obs", None)
                     ),
-                    save_flags=save_flags,
-                    forward_inputs=result["forward_inputs"],
-                    versions=torch.full_like(
-                        result["prev_logprobs"],
-                        float(self.version),
-                        dtype=torch.float32,
-                    ),
                 )
-                self.send_rollout_result(output_channel, rollout_result, mode="train")
-        for _ in range(self.num_pipeline_stages):
-            env_output = await self.recv_env_output(input_channel)
-            actions, result = self.predict(env_output["obs"])
-
-            rollout_result = RolloutResult(
-                actions=actions,
-                prev_values=result["prev_values"] if self.collect_prev_infos else None,
-                bootstrap_values=self.get_bootstrap_values(
-                    env_output.get("final_obs", None)
-                ),
-            )
+            finally:
+                if self.single_gpu_serial_offload and self.enable_offload:
+                    self.offload_model()
             self.send_rollout_result(output_channel, rollout_result, mode="train")
 
     @Worker.timer("rollout/generate")
@@ -476,7 +523,7 @@ class MultiStepRolloutWorker(Worker):
         input_channel: Channel,
         output_channel: Channel,
     ):
-        if self.enable_offload:
+        if self.enable_offload and not self.single_gpu_serial_offload:
             self.reload_model()
 
         for _ in tqdm(
@@ -486,11 +533,11 @@ class MultiStepRolloutWorker(Worker):
         ):
             await self.generate_one_epoch(input_channel, output_channel)
 
-        if self.enable_offload:
+        if self.enable_offload and not self.single_gpu_serial_offload:
             self.offload_model()
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
-        if self.enable_offload:
+        if self.enable_offload and not self.single_gpu_serial_offload:
             self.reload_model()
         for _ in tqdm(
             range(self.eval_rollout_epoch),
@@ -500,20 +547,30 @@ class MultiStepRolloutWorker(Worker):
             for _ in range(self.n_eval_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    actions, _ = self.predict(env_output["obs"], mode="eval")
+                    if self.single_gpu_serial_offload and self.enable_offload:
+                        self.reload_model()
+                    try:
+                        actions, _ = self.predict(env_output["obs"], mode="eval")
+                    finally:
+                        if self.single_gpu_serial_offload and self.enable_offload:
+                            self.offload_model()
                     self.send_chunk_actions(output_channel, actions, mode="eval")
 
-        if self.enable_offload:
+        if self.enable_offload and not self.single_gpu_serial_offload:
             self.offload_model()
 
     def offload_model(self):
         if self.enable_cuda_graph:
             self.hf_model.release_cuda_graph()
         self.hf_model.to("cpu")
+        if self.expert_model is not None:
+            self.expert_model.to("cpu")
         self.torch_platform.empty_cache()
 
     def reload_model(self):
         self.hf_model.to(self.device)
+        if self.expert_model is not None:
+            self.expert_model.to(self.device)
         if self.enable_cuda_graph:
             self.hf_model.capture_cuda_graph(
                 train_batch_size=self.train_batch_size,

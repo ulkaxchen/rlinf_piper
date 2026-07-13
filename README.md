@@ -30,6 +30,7 @@ RLinf is a flexible and scalable open-source RL infrastructure designed for Embo
 
 
 ## What's NEW!
+- [2026/07] 🔥 RLinf supports single-GPU GRPO fine-tuning for pi0.5 with the distilled [DreamDojo](https://github.com/NVIDIA/DreamDojo) streaming world model. Doc: [RL with the DreamDojo Student](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/dreamdojo_student.html).
 - [2026/06] 🔥 RLinf supports reinforcement learning fine-tuning for [GR00T-N1.7](https://github.com/NVIDIA/Isaac-GR00T). Doc: [RL on GR00T-N1.7](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/gr00t.html).
 - [2026/06] 🔥 RLinf supports reinforcement learning fine-tuning with the Polaris simulator. Doc: [RL on Polaris](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/polaris.html).
 - [2026/06] 🔥 RLinf supports reinforcement learning fine-tuning for [GR00T-N1.6](https://github.com/NVIDIA/Isaac-GR00T). Doc: [RL on GR00T-N1.6](https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/gr00t.html).
@@ -164,6 +165,7 @@ RLinf supports SFT, simulation RL, and real-world RL for World Action Models (WA
           </ul>
           <ul>
             <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/wan.html">Wan</a> ✅</li>
+            <li><a href="https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/dreamdojo_student.html">DreamDojo Student</a> ✅</li>
           </ul>
           <li><b>Custom Models</b></li>
           <ul>

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shutil
 import time
 from functools import partial
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -71,6 +73,11 @@ from rlinf.utils.nested_dict_process import (
 from rlinf.utils.placement import (
     HybridComponentPlacement,
     ModelParallelComponentPlacement,
+)
+from rlinf.utils.serial_checkpoint import (
+    load_trainable_model_state,
+    save_named_tensors,
+    trim_host_allocator,
 )
 from rlinf.utils.utils import (
     clear_memory,
@@ -1009,6 +1016,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._rollout_all_ranks = list(
             range(self._component_placement.get_world_size("rollout"))
         )
+        self._serial_model_checkpoint_path: str | None = None
 
     def init_worker(self) -> None:
         """
@@ -1021,10 +1029,163 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad()
             self.offload_optimizer()
 
+    def release_worker(self) -> None:
+        """Release actor training state between serial single-GPU updates.
+
+        Parameter and optimizer offload only moves tensors to host memory.  A
+        DreamDojo rollout cannot coexist with those host copies on a 64 GiB
+        workstation, so the serial lifecycle checkpoints the actor first and
+        then calls this method to drop the complete FSDP training state.
+        """
+        self.rollout_batch = None
+        for name in ("grad_scaler", "lr_scheduler", "optimizer", "model"):
+            if hasattr(self, name):
+                delattr(self, name)
+
+        self.is_weight_offloaded = False
+        self.is_optimizer_offloaded = False
+        trim_host_allocator()
+        clear_memory()
+
+    def configure_serial_restore(self, checkpoint_path: str | None) -> None:
+        """Select the streamed model state to apply before FSDP wrapping."""
+        self._serial_model_checkpoint_path = checkpoint_path
+
+    def drop_rollout_batch(self) -> None:
+        """Release trajectory tensors once the optimizer update has finished."""
+        self.rollout_batch = None
+        trim_host_allocator()
+
+    def save_serial_training_state(self, checkpoint_path: str) -> None:
+        """Stream optimizer state without constructing a full state dict."""
+        if not self.is_optimizer_offloaded:
+            self.offload_optimizer()
+        if not self.is_weight_offloaded:
+            self.offload_param_and_grad()
+
+        state_dir = Path(checkpoint_path) / "serial_optimizer"
+        shutil.rmtree(state_dir, ignore_errors=True)
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        parameter_files: list[list[str]] = []
+        for group_index, group in enumerate(self.optimizer.param_groups):
+            group_files = []
+            for parameter_index, parameter in enumerate(group["params"]):
+                filename = f"state_{group_index:03d}_{parameter_index:05d}.pt"
+                torch.save(self.optimizer.state[parameter], state_dir / filename)
+                group_files.append(filename)
+            parameter_files.append(group_files)
+
+        optimizer_groups = self.optimizer.state_dict()["param_groups"]
+        metadata = {
+            "parameter_files": parameter_files,
+            "optimizer_param_groups": optimizer_groups,
+            "lr_scheduler": self.lr_scheduler.state_dict(),
+            "grad_scaler": self.grad_scaler.state_dict(),
+            "optimizer_steps": self.optimizer_steps,
+            "version": self.version,
+        }
+        torch.save(metadata, state_dir / "metadata.pt")
+
+    def save_serial_model_state(self, checkpoint_path: str) -> None:
+        """Stream FSDP flat parameters using their original model names."""
+        if not self.is_weight_offloaded:
+            self.offload_param_and_grad()
+
+        module_names = {
+            id(module): ".".join(
+                part for part in name.split(".") if part != "_fsdp_wrapped_module"
+            )
+            for name, module in self.model.named_modules()
+        }
+        named_tensors = []
+        seen_names = set()
+        for handle in self._strategy._iter_fsdp_handles(self.model):
+            flat_parameter = handle.flat_param
+            views = handle._get_unflat_views(flat_parameter)
+            for parameter_info, view in zip(
+                flat_parameter._param_infos, views, strict=True
+            ):
+                module_name = module_names.get(id(parameter_info.module))
+                if module_name is None:
+                    raise KeyError(
+                        "Could not resolve the original module path for FSDP "
+                        f"parameter {parameter_info.param_name}."
+                    )
+                name = (
+                    f"{module_name}.{parameter_info.param_name}"
+                    if module_name
+                    else parameter_info.param_name
+                )
+                if not view.requires_grad or name in seen_names:
+                    continue
+                named_tensors.append((name, view))
+                seen_names.add(name)
+        del module_names
+        save_named_tensors(named_tensors, checkpoint_path)
+
+    def load_serial_training_state(self, checkpoint_path: str) -> None:
+        """Restore optimizer state one parameter at a time."""
+        state_dir = Path(checkpoint_path) / "serial_optimizer"
+        metadata_path = state_dir / "metadata.pt"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Missing serial optimizer metadata: {metadata_path}"
+            )
+        metadata = torch.load(metadata_path, map_location="cpu", weights_only=True)
+
+        parameter_files = metadata["parameter_files"]
+        if len(parameter_files) != len(self.optimizer.param_groups):
+            raise ValueError("Serial optimizer parameter-group count mismatch.")
+        for group, group_files in zip(
+            self.optimizer.param_groups, parameter_files, strict=True
+        ):
+            if len(group_files) != len(group["params"]):
+                raise ValueError("Serial optimizer parameter count mismatch.")
+            for parameter, filename in zip(group["params"], group_files, strict=True):
+                saved_state = torch.load(
+                    state_dir / filename,
+                    map_location="cpu",
+                    weights_only=True,
+                    mmap=True,
+                )
+                current_state = self.optimizer.state[parameter]
+                for key, value in saved_state.items():
+                    if torch.is_tensor(value) and torch.is_tensor(
+                        current_state.get(key)
+                    ):
+                        current_state[key].copy_(
+                            value.to(
+                                dtype=current_state[key].dtype,
+                                device=current_state[key].device,
+                            )
+                        )
+                    else:
+                        current_state[key] = value
+                del saved_state
+
+        for group, saved_group in zip(
+            self.optimizer.param_groups,
+            metadata["optimizer_param_groups"],
+            strict=True,
+        ):
+            for key, value in saved_group.items():
+                if key != "params":
+                    group[key] = value
+        self.lr_scheduler.load_state_dict(metadata["lr_scheduler"])
+        self.grad_scaler.load_state_dict(metadata["grad_scaler"])
+        self.optimizer_steps = int(metadata["optimizer_steps"])
+        self.version = int(metadata["version"])
+        del metadata
+        trim_host_allocator()
+
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
         if model is None:
             model = super().model_provider_func()
+
+        if self._serial_model_checkpoint_path is not None:
+            load_trainable_model_state(model, self._serial_model_checkpoint_path)
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
@@ -1372,6 +1533,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
+
+        if (
+            self.cfg.runner.get("single_gpu_serial_offload", False)
+            and self.enable_offload
+        ):
+            if not self.is_optimizer_offloaded:
+                self.offload_optimizer()
+            if not self.is_weight_offloaded:
+                self.offload_param_and_grad()
+            clear_memory()
 
         return mean_metric_dict
 

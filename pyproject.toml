@@ -34,12 +34,10 @@ dependencies = [
     "torch>=2.5.0",
     "hydra-core",
     "numpy",
-
     # Data processing
     "datasets",
     "torchdata",
     "scipy",
-
     # Utilities
     "accelerate",
     "debugpy",
@@ -57,13 +55,12 @@ dependencies = [
     "pip",
     "huggingface_hub",
     "icmplib",
-
     # Logging
     "wandb<0.25.1",
     "swanlab>=0.6.11",
     "tensorboard",
-
-    "sortedcontainers"
+    "sortedcontainers",
+    "pynvml>=13.0.1",
 ]
 
 [project.urls]

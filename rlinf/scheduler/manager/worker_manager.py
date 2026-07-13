@@ -243,6 +243,11 @@ class WorkerNode:
             worker_info (WorkerInfo): The information about the child worker node.
 
         """
+        for index, node in enumerate(self._nodes):
+            if node._worker_address.rank == rank:
+                self._nodes[index] = WorkerNode(node._worker_address, worker_info)
+                return
+
         child_address = self._worker_address.get_child_address(rank)
         child_node = WorkerNode(child_address, worker_info)
 

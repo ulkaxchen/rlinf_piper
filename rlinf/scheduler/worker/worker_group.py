@@ -208,6 +208,36 @@ class WorkerGroup(Generic[WorkerClsType]):
         self._execution_ranks = list(ranks)
         return self
 
+    def restart(self) -> "WorkerGroup[WorkerClsType]":
+        """Restart all Ray actors while preserving this group's placement."""
+        if self._cluster is None or self._placement_strategy is None:
+            raise RuntimeError("Cannot restart a worker group before launch.")
+
+        actor_names = []
+        for worker_info in self._workers:
+            actor_names.append(
+                WorkerAddress.from_parent_name_rank(
+                    self._worker_group_name, worker_info.rank
+                ).get_name()
+            )
+            ray.kill(worker_info.worker, no_restart=True)
+        self._workers.clear()
+
+        deadline = time.monotonic() + 30
+        for actor_name in actor_names:
+            while time.monotonic() < deadline:
+                try:
+                    ray.get_actor(actor_name, namespace=Cluster.NAMESPACE)
+                except ValueError:
+                    break
+                time.sleep(0.05)
+            else:
+                raise TimeoutError(f"Timed out stopping Ray actor {actor_name}.")
+
+        self._create_workers()
+        self._is_ready().wait()
+        return self
+
     def _close(self):
         """Close the worker group and release resources. This method is called when the worker group is no longer needed."""
         for worker_info in self._workers:

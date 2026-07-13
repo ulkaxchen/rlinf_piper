@@ -1,0 +1,98 @@
+env_type: dreamdojo_student_wm
+task_suite_name: piper_insert_mouse_battery
+wm_env_type: piper
+
+total_num_envs: null
+
+auto_reset: False
+ignore_terminations: False
+# 32 policy chunks per trajectory. Student chunk_step consumes 12 actions, so
+# 32 * 12 = 384 30Hz actions. Truncation lands on a chunk boundary.
+max_steps_per_rollout_epoch: 384
+max_episode_steps: 384
+
+use_rel_reward: False
+reward_coef: 1.0
+
+is_eval: False
+
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: True
+use_ordered_reset_state_ids: False
+specific_reset_id: null
+
+video_cfg:
+  save_video: True
+  info_on_video: True
+  fps: 10
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+
+### DreamDojo causal student parameters
+
+dreamdojo_repo_path: /home/fenrir/ubunto_data_2/worldmodel/DreamDojo
+dreamdojo_ckpt_path: /home/fenrir/ubunto_data_2/worldmodel/RLinf/checkpoints/dreamdojo_distill_3000
+experiment: cosmos_predict2p5_2B_action_gr00t_pretrain_self_forcing_no_s3
+config_file: cosmos_predict2/_src/predict2/interactive/configs/config_distill.py
+dreamdojo_backend: distilled_student
+# The distill-3000 student and EMA use the experiment's native 256-frame RoPE
+# table. The env disables the distillation-only fake-score network at load time.
+cr1_embeddings_path: /home/fenrir/ubunto_data_2/worldmodel/RLinf/checkpoints/cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt
+dreamdojo_context_parallel_size: 1
+dreamdojo_enable_fsdp: false
+dreamdojo_torch_compile: false
+# The one-GPU serial runner reloads the DCP checkpoint for each environment
+# phase instead of retaining the inactive world model in host memory.
+student_unload_on_offload: true
+# Avoid overlapping the 2B DiT and full-resolution causal VAE decode on 32GB.
+student_decode_dit_offload: true
+
+enable_kir: False
+initial_image_path: /home/fenrir/ubunto_data_2/worldmodel/data/piper_initial_frames
+
+# One env step: 12 policy actions at 30 Hz -> 4 student actions/frames at 10 Hz.
+chunk: 12
+action_stride: 3
+num_inference_steps: 4
+student_actions_per_latent: 4
+student_cache_latents: 3
+student_condition_fps: 4.0
+# Native student initialization is 1 conditioning frame + 12 model actions ->
+# 12 predicted frames. The reset NPY must therefore contain the first 36 raw
+# 30Hz actions under ``abs_action``; these demonstration actions warm the cache
+# but are not included in the VLA/GRPO trajectory.
+student_bootstrap_enabled: true
+student_bootstrap_action_key: abs_action
+student_bootstrap_policy_actions: 36
+
+height: 1440
+width: 640
+num_latent_conditional_frames: 0
+image_size: [480, 640]
+num_camera_views: 3
+
+disable_online_text_encoder: True
+text_embedding_cache_path: ${.cr1_embeddings_path}
+negative_text_embedding_cache_path: ${.cr1_embeddings_path}
+
+model_action_dim: 384
+action_slot: [169, 183]
+policy_action_format: absolute
+action_delta_window: 4
+action_norm_mode: min_max
+action_norm_key: action
+action_norm_stats_path: /home/fenrir/ubunto_data_2/worldmodel/RLinf/checkpoints/base_policy_30000/assets/dreamdojo_action_stats.json
+
+reward_model:
+  type: resnet
+  model_path: /home/fenrir/ubunto_data_2/worldmodel/RLinf/checkpoints/reward_model/full_weights.pt
+  arch: resnet18
+  pretrained: False
+  hidden_dim: null
+  dropout: 0
+  image_size: [3, 1440, 640]
+  normalize: true
+  precision: fp32
+  reward_threshold: null

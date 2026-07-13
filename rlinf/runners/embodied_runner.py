@@ -15,6 +15,7 @@
 import logging
 import os
 import queue
+import shutil
 import threading
 import time
 from collections import defaultdict
@@ -29,6 +30,7 @@ from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_table
 from rlinf.utils.runner_utils import check_progress
+from rlinf.utils.serial_checkpoint import serial_model_state_exists
 from rlinf.utils.timers import Timer
 
 logger = logging.getLogger(__name__)
@@ -71,8 +73,22 @@ class EmbodiedRunner:
         self.critic = critic
         self.reward = reward
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
-        self.overlap_env_bootstrap = bool(
-            self.cfg.runner.get("overlap_env_bootstrap", False)
+        self.single_gpu_serial_offload = bool(
+            self.cfg.runner.get("single_gpu_serial_offload", False)
+        )
+        self.single_gpu_serial_lazy_actor_init = bool(
+            self.cfg.runner.get("single_gpu_serial_lazy_actor_init", False)
+        )
+        self.single_gpu_serial_unload_env = bool(
+            self.cfg.runner.get("single_gpu_serial_unload_env", False)
+        )
+        self._actor_initialized = False
+        self._serial_actor_checkpoint_path: str | None = None
+        self._serial_rollout_model_released = False
+        self._serial_channel_generation = 0
+        self.overlap_env_bootstrap = (
+            bool(self.cfg.runner.get("overlap_env_bootstrap", False))
+            and not self.single_gpu_serial_offload
         )
 
         # Step-gated profiling: ``cluster.profiling.steps`` lists the global step
@@ -162,14 +178,78 @@ class EmbodiedRunner:
 
     def init_workers(self):
         # create worker in order to decrease the maximum memory usage
-        rollout_handle = self.rollout.init_worker()
-        env_handle = self.env.init_worker()
-        if self.reward is not None:
-            self.reward.init_worker().wait()
+        if self.single_gpu_serial_lazy_actor_init:
+            if not self.single_gpu_serial_offload:
+                raise ValueError(
+                    "runner.single_gpu_serial_lazy_actor_init=True requires "
+                    "runner.single_gpu_serial_offload=True."
+                )
+            if not self.single_gpu_serial_unload_env:
+                raise ValueError(
+                    "runner.single_gpu_serial_lazy_actor_init=True requires "
+                    "runner.single_gpu_serial_unload_env=True."
+                )
+            if self.cfg.actor.fsdp_config.get("save_full_model_weights", True):
+                raise ValueError(
+                    "The serial actor lifecycle requires "
+                    "actor.fsdp_config.save_full_model_weights=False to avoid "
+                    "materializing a second full CPU state dict while saving."
+                )
+            if self._profile_all_steps or self._profile_steps:
+                raise ValueError(
+                    "Profiling is not supported with "
+                    "runner.single_gpu_serial_lazy_actor_init=True."
+                )
 
-        rollout_handle.wait()
-        env_handle.wait()
+            self.rollout.init_worker().wait()
+            resume_dir = self.cfg.runner.get("resume_dir", None)
+            if resume_dir is not None:
+                actor_checkpoint_path = os.path.join(resume_dir, "actor")
+                assert os.path.exists(actor_checkpoint_path), (
+                    f"resume_dir {actor_checkpoint_path} does not exist."
+                )
+                if not serial_model_state_exists(actor_checkpoint_path):
+                    raise ValueError(
+                        "Serial single-GPU resume requires a streamed checkpoint "
+                        f"under {actor_checkpoint_path}/serial_model."
+                    )
+                self.global_step = int(resume_dir.split("global_step_")[-1])
+                self.logger.info(
+                    "Restoring rollout expert weights before DreamDojo "
+                    f"initialization: {actor_checkpoint_path}."
+                )
+                self.rollout.restore_serial_model(actor_checkpoint_path).wait()
+                self._serial_actor_checkpoint_path = actor_checkpoint_path
+
+            self.env.init_worker().wait()
+            if self.reward is not None:
+                self.reward.init_worker().wait()
+            self.logger.info(
+                "Deferring actor model initialization until each complete "
+                "rollout has finished and the environment has been unloaded."
+            )
+            return
+
+        if self.single_gpu_serial_offload:
+            self.logger.info(
+                "Initializing rollout, env, reward, and actor workers serially "
+                "for runner.single_gpu_serial_offload=True."
+            )
+            self.rollout.init_worker().wait()
+            self.env.init_worker().wait()
+            if self.reward is not None:
+                self.reward.init_worker().wait()
+        else:
+            rollout_handle = self.rollout.init_worker()
+            env_handle = self.env.init_worker()
+            if self.reward is not None:
+                self.reward.init_worker().wait()
+
+            rollout_handle.wait()
+            env_handle.wait()
+
         self.actor.init_worker().wait()
+        self._actor_initialized = True
 
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:
@@ -304,7 +384,7 @@ class EmbodiedRunner:
         training_metrics = [result.get("training_metrics", {}) for result in results]
         return rollout_metrics, training_metrics
 
-    def _maybe_eval_and_checkpoint(self, step: int) -> dict:
+    def _progress_flags(self) -> tuple[bool, bool]:
         run_val, save_model, _ = check_progress(
             self.global_step,
             self.max_steps,
@@ -313,19 +393,110 @@ class EmbodiedRunner:
             1.0,
             run_time_exceeded=False,
         )
+        return run_val, save_model
+
+    def _maybe_eval_and_checkpoint(
+        self,
+        step: int,
+        *,
+        weights_synced: bool = False,
+        checkpoint_saved: bool = False,
+    ) -> dict:
+        run_val, save_model = self._progress_flags()
 
         eval_metrics = {}
         if run_val:
             with self.timer("eval"):
-                self.update_rollout_weights()
+                if self._serial_rollout_model_released:
+                    assert self._serial_actor_checkpoint_path is not None
+                    self.rollout.restore_serial_model(
+                        self._serial_actor_checkpoint_path
+                    ).wait()
+                    self._serial_rollout_model_released = False
+                if not weights_synced:
+                    self.update_rollout_weights()
                 eval_metrics = self.evaluate()
                 eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                 self.metric_logger.log(data=eval_metrics, step=step)
 
-        if save_model:
+        if save_model and not checkpoint_saved:
             self._save_checkpoint()
 
         return eval_metrics
+
+    def _actor_checkpoint_path(self, *, persistent: bool) -> str:
+        base_output_dir = os.path.join(
+            self.cfg.runner.logger.log_path,
+            self.cfg.runner.logger.experiment_name,
+        )
+        if persistent:
+            checkpoint_root = os.path.join(base_output_dir, "checkpoints")
+        else:
+            checkpoint_root = os.path.join(base_output_dir, ".serial_actor_state")
+        return os.path.join(
+            checkpoint_root,
+            f"global_step_{self.global_step}",
+            "actor",
+        )
+
+    def _save_and_release_serial_actor(self, *, persistent: bool) -> None:
+        """Checkpoint and release actor state for the next rollout."""
+        self.actor.drop_rollout_batch().wait()
+        self.actor.set_global_step(self.global_step).wait()
+
+        actor_save_path = self._actor_checkpoint_path(persistent=persistent)
+        os.makedirs(actor_save_path, exist_ok=True)
+        self.logger.info(
+            "Saving streamed serial actor state at step "
+            f"{self.global_step}: {actor_save_path}."
+        )
+        self.actor.save_serial_model_state(actor_save_path).wait()
+        self.actor.save_serial_training_state(actor_save_path).wait()
+        self.actor.release_worker().wait()
+        self._actor_initialized = False
+
+        previous_path = self._serial_actor_checkpoint_path
+        self._serial_actor_checkpoint_path = actor_save_path
+        if previous_path is None or previous_path == actor_save_path:
+            return
+
+        transient_root = os.path.abspath(
+            os.path.join(
+                self.cfg.runner.logger.log_path,
+                self.cfg.runner.logger.experiment_name,
+                ".serial_actor_state",
+            )
+        )
+        previous_step_dir = os.path.abspath(os.path.dirname(previous_path))
+        if os.path.commonpath([transient_root, previous_step_dir]) == transient_root:
+            shutil.rmtree(previous_step_dir, ignore_errors=True)
+
+    def _restart_serial_runtime(self) -> None:
+        """Restart serial workers and channels between global steps."""
+        self.env_channel.close()
+        self.rollout_channel.close()
+        self.actor_channel.close()
+        if self.reward_channel is not None:
+            self.reward_channel.close()
+
+        self.actor.restart()
+        self.rollout.restart()
+        self.env.restart()
+        if self.reward is not None:
+            self.reward.restart()
+
+        self._serial_channel_generation += 1
+        generation = self._serial_channel_generation
+        self.env_channel = Channel.create(f"EnvSerial{generation}")
+        self.rollout_channel = Channel.create(f"RolloutSerial{generation}")
+        self.actor_channel = Channel.create(f"ActorSerial{generation}")
+        if self.reward is not None:
+            self.reward_channel = Channel.create(f"RewardSerial{generation}")
+
+        self.rollout.init_worker().wait()
+        self.env.init_worker().wait()
+        if self.reward is not None:
+            self.reward.init_worker().wait()
 
     def _log_step_metrics(
         self,
@@ -481,8 +652,20 @@ class EmbodiedRunner:
         start_step = self.global_step
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
+            if self._serial_rollout_model_released:
+                assert self._serial_actor_checkpoint_path is not None
+                self.logger.info(
+                    "Restoring rollout expert weights for the next trajectory "
+                    f"from {self._serial_actor_checkpoint_path}."
+                )
+                self.rollout.restore_serial_model(
+                    self._serial_actor_checkpoint_path
+                ).wait()
+                self._serial_rollout_model_released = False
+
             # set global step
-            self.actor.set_global_step(self.global_step)
+            if self._actor_initialized:
+                self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
 
             profiled_step = (
@@ -495,7 +678,10 @@ class EmbodiedRunner:
 
             with self.timer("step"):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if (
+                        self._actor_initialized
+                        and _step % self.weight_sync_interval == 0
+                    ):
                         self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
                     env_handle: Handle = self.env.interact(
@@ -514,6 +700,36 @@ class EmbodiedRunner:
                             input_channel=self.reward_channel,
                             output_channel=self.env_channel,
                         )
+                    if not self._actor_initialized:
+                        # Wait for the complete trajectory and environment
+                        # unload before constructing the actor's model and
+                        # optimizer on this memory-constrained single-GPU path.
+                        rollout_handle.wait()
+                        if self.reward is not None:
+                            reward_handle.wait()
+                        env_handle.wait()
+                        if self.single_gpu_serial_lazy_actor_init:
+                            self.rollout.release_serial_model().wait()
+                            self._serial_rollout_model_released = True
+                        self.logger.info(
+                            "Initializing actor after rollout and environment "
+                            "unload for the serial training path."
+                        )
+                        self.actor.configure_serial_restore(
+                            self._serial_actor_checkpoint_path
+                        ).wait()
+                        self.actor.init_worker().wait()
+                        self._actor_initialized = True
+                        if self._serial_actor_checkpoint_path is not None:
+                            self.logger.info(
+                                "Restoring serial actor training state from "
+                                f"{self._serial_actor_checkpoint_path}."
+                            )
+                            self.actor.load_serial_training_state(
+                                self._serial_actor_checkpoint_path
+                            ).wait()
+                        self.actor.set_global_step(self.global_step).wait()
+
                     self.actor.recv_rollout_trajectories(
                         input_channel=self.actor_channel
                     ).wait()
@@ -540,7 +756,16 @@ class EmbodiedRunner:
                     env_bootstrap_handle.wait()
 
                 self.global_step += 1
-                eval_metrics = self._maybe_eval_and_checkpoint(_step)
+                if self.single_gpu_serial_lazy_actor_init:
+                    _, save_model = self._progress_flags()
+                    self._save_and_release_serial_actor(persistent=save_model)
+                    eval_metrics = self._maybe_eval_and_checkpoint(
+                        _step,
+                        weights_synced=True,
+                        checkpoint_saved=save_model,
+                    )
+                else:
+                    eval_metrics = self._maybe_eval_and_checkpoint(_step)
 
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
@@ -557,6 +782,8 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
+            if self.single_gpu_serial_lazy_actor_init and _step + 1 < self.max_steps:
+                self._restart_serial_runtime()
 
         self._finish_run()
 
