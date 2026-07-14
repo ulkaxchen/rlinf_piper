@@ -17,10 +17,16 @@
 DreamDojo environments reuse RLinf's :class:`NpyTrajectoryDatasetWrapper`,
 which expects one object-array ``.npy`` file per episode. The distilled student
 additionally needs the first 36 absolute 30 Hz actions for its native reset
-warmup. The default direct loader therefore reads the LeRobot parquet and three
-camera videos and writes ``image``, ``abs_action``, ``init_ee_pose``, and task
-metadata. The older DreamDojo loader remains available for teacher-only reset
-exports with ``--loader dreamdojo``.
+warmup. The default direct loader therefore stores the first three-camera image
+plus all 36 ``abs_action`` and ``init_ee_pose`` records. Later images are omitted
+because the student uses generated frames after the initial condition; pass
+``--store-all-images`` only for consumers that need every source image.
+
+The converter also writes ``action_stats.json`` beside the reset trajectories.
+It aggregates every episode in LeRobot's ``meta/episodes_stats.jsonl`` (not only
+the exported reset subset), producing the ``action.min``/``action.max`` format
+used by the DreamDojo action conditioner. The older DreamDojo loader remains
+available for teacher-only reset exports with ``--loader dreamdojo``.
 
 Example::
 
@@ -67,6 +73,102 @@ def _load_task_map(dataset_path: Path) -> dict[int, str]:
             item = json.loads(line)
             task_map[int(item["task_index"])] = str(item["task"])
     return task_map
+
+
+def _action_bounds(
+    entry: dict, source: Path, piper_action_dim: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract and validate one action min/max entry."""
+    if "min" not in entry or "max" not in entry:
+        raise KeyError(f"Action stats in {source} must contain 'min' and 'max'.")
+    action_min = np.asarray(entry["min"], dtype=np.float32).reshape(-1)
+    action_max = np.asarray(entry["max"], dtype=np.float32).reshape(-1)
+    if action_min.size < piper_action_dim or action_max.size < piper_action_dim:
+        raise ValueError(
+            f"Action stats in {source} have fewer than {piper_action_dim} dims: "
+            f"min={action_min.size}, max={action_max.size}."
+        )
+    return action_min[:piper_action_dim], action_max[:piper_action_dim]
+
+
+def _load_global_action_bounds(
+    dataset_path: Path,
+    action_key: str,
+    piper_action_dim: int,
+) -> tuple[np.ndarray, np.ndarray, Path]:
+    """Load global bounds from LeRobot aggregate or per-episode statistics."""
+    stats_path = dataset_path / "meta" / "stats.json"
+    if stats_path.exists():
+        with stats_path.open("r", encoding="utf-8") as file:
+            stats = json.load(file)
+        if action_key not in stats:
+            raise KeyError(
+                f"{action_key!r} not found in {stats_path}; available: {list(stats)}"
+            )
+        action_min, action_max = _action_bounds(
+            stats[action_key], stats_path, piper_action_dim
+        )
+        return action_min, action_max, stats_path
+
+    episode_stats_path = dataset_path / "meta" / "episodes_stats.jsonl"
+    if not episode_stats_path.exists():
+        raise FileNotFoundError(
+            "Cannot derive DreamDojo action normalization: neither "
+            f"{stats_path} nor {episode_stats_path} exists."
+        )
+
+    global_min = None
+    global_max = None
+    with episode_stats_path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            episode_stats = item.get("stats", {})
+            if action_key not in episode_stats:
+                raise KeyError(
+                    f"{action_key!r} missing from {episode_stats_path}:{line_number}."
+                )
+            action_min, action_max = _action_bounds(
+                episode_stats[action_key], episode_stats_path, piper_action_dim
+            )
+            global_min = (
+                action_min if global_min is None else np.minimum(global_min, action_min)
+            )
+            global_max = (
+                action_max if global_max is None else np.maximum(global_max, action_max)
+            )
+
+    if global_min is None or global_max is None:
+        raise ValueError(f"No episode statistics found in {episode_stats_path}.")
+    return global_min, global_max, episode_stats_path
+
+
+def _write_action_stats(
+    dataset_path: Path,
+    output_path: Path,
+    action_key: str,
+    piper_action_dim: int,
+) -> None:
+    """Write the min/max schema consumed by ``DreamDojoEnv``."""
+    action_min, action_max, source = _load_global_action_bounds(
+        dataset_path, action_key, piper_action_dim
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(
+            {
+                action_key: {
+                    "min": action_min.tolist(),
+                    "max": action_max.tolist(),
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote global action stats from {source} to {output_path}.")
 
 
 def _normalize_camera_keys(camera_keys: str) -> list[str]:
@@ -157,6 +259,7 @@ def _export_direct(args: argparse.Namespace) -> int:
     print(f"Found {len(parquet_files)} episodes; exporting {num_episodes} episodes.")
     print(f"Using cameras: {', '.join(cameras)}")
 
+    store_all_images = bool(getattr(args, "store_all_images", False))
     for parquet_path in parquet_files[:num_episodes]:
         episode_idx = _episode_id(parquet_path)
         dataframe = pd.read_parquet(parquet_path)
@@ -169,27 +272,24 @@ def _export_direct(args: argparse.Namespace) -> int:
         )
         instruction = task_map.get(task_index, args.instruction)
 
+        image_frame_count = num_frames if store_all_images else 1
         camera_frames = [
             _read_video_frames(
                 _find_video_path(dataset_path, camera_key, episode_idx),
-                num_frames,
+                image_frame_count,
                 per_view_size,
             )
             for camera_key in cameras
         ]
-        num_frames = min(num_frames, *(len(frames) for frames in camera_frames))
-        if num_frames < args.frames_per_file:
+        available_image_frames = min(len(frames) for frames in camera_frames)
+        if available_image_frames < image_frame_count:
             raise ValueError(
-                f"Episode {episode_idx} has only {num_frames} aligned frames; "
-                f"requested {args.frames_per_file}."
+                f"Episode {episode_idx} has only {available_image_frames} aligned "
+                f"camera frames; requested {image_frame_count}."
             )
 
         frames = []
         for frame_idx in range(num_frames):
-            image = np.concatenate(
-                [frames_for_camera[frame_idx] for frames_for_camera in camera_frames],
-                axis=0,
-            )
             state = (
                 np.asarray(
                     dataframe["observation.state"].iloc[frame_idx], dtype=np.float32
@@ -207,18 +307,36 @@ def _export_direct(args: argparse.Namespace) -> int:
                     f"Episode {episode_idx} frame {frame_idx} has action dim "
                     f"{action.size}; need {args.piper_action_dim}."
                 )
-            frames.append(
-                {
-                    "image": image,
-                    "delta_action": np.zeros(args.piper_action_dim, dtype=np.float32),
-                    "abs_action": action[: args.piper_action_dim],
-                    "init_ee_pose": state[: args.piper_action_dim],
-                    "instruction": instruction,
-                }
-            )
+            frame = {
+                "delta_action": np.zeros(args.piper_action_dim, dtype=np.float32),
+                "abs_action": action[: args.piper_action_dim],
+                "init_ee_pose": state[: args.piper_action_dim],
+                "instruction": instruction,
+            }
+            if store_all_images or frame_idx == 0:
+                image_idx = frame_idx if store_all_images else 0
+                frame["image"] = np.concatenate(
+                    [
+                        frames_for_camera[image_idx]
+                        for frames_for_camera in camera_frames
+                    ],
+                    axis=0,
+                )
+            frames.append(frame)
 
         out_path = out_dir / f"episode_{episode_idx:05d}.npy"
         _write_episode(out_path, frames)
+
+    action_stats_out = getattr(args, "action_stats_out", None)
+    action_stats_path = (
+        Path(action_stats_out) if action_stats_out else out_dir / "action_stats.json"
+    )
+    _write_action_stats(
+        dataset_path,
+        action_stats_path,
+        getattr(args, "action_stats_key", "action"),
+        args.piper_action_dim,
+    )
 
     return num_episodes
 
@@ -293,6 +411,20 @@ def main() -> None:
         ),
     )
     parser.add_argument("--loader", choices=["direct", "dreamdojo"], default="direct")
+    parser.add_argument(
+        "--store-all-images",
+        action="store_true",
+        help=(
+            "Store all source images instead of only the initial condition. "
+            "The distilled-student reset path does not need this."
+        ),
+    )
+    parser.add_argument(
+        "--action-stats-out",
+        default=None,
+        help="Output path for action min/max (default: OUT_DIR/action_stats.json).",
+    )
+    parser.add_argument("--action-stats-key", default="action")
     parser.add_argument("--num-frames", type=int, default=13)
     parser.add_argument("--height", type=int, default=1440)
     parser.add_argument("--width", type=int, default=640)

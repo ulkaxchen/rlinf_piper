@@ -260,6 +260,8 @@ def test_student_checkpoint_opts_add_explicit_full_tokenizer(tmp_path):
 
 
 def test_piper_reset_export_contains_36_absolute_actions(tmp_path, monkeypatch):
+    import json
+
     import pandas as pd
 
     dataset_path = tmp_path / "lerobot"
@@ -267,6 +269,38 @@ def test_piper_reset_export_contains_36_absolute_actions(tmp_path, monkeypatch):
     parquet.parent.mkdir(parents=True)
     parquet.touch()
     out_dir = tmp_path / "reset_36"
+    episode_stats_path = dataset_path / "meta" / "episodes_stats.jsonl"
+    episode_stats_path.parent.mkdir(parents=True)
+    episode_stats_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "episode_index": 0,
+                        "stats": {
+                            "action": {
+                                "min": [0.0] * 14,
+                                "max": [35.0] * 14,
+                            }
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "episode_index": 1,
+                        "stats": {
+                            "action": {
+                                "min": [-2.0] * 14,
+                                "max": [50.0] * 14,
+                            }
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     dataframe = pd.DataFrame(
         {
@@ -307,10 +341,14 @@ def test_piper_reset_export_contains_36_absolute_actions(tmp_path, monkeypatch):
 
     assert len(trajectory) == 36
     assert trajectory[0]["image"].shape == (6, 2, 3)
+    assert "image" not in trajectory[-1]
     assert trajectory[0]["abs_action"].shape == (14,)
     assert np.array_equal(
         trajectory[-1]["abs_action"], np.full(14, 35, dtype=np.float32)
     )
+    action_stats = json.loads((out_dir / "action_stats.json").read_text())
+    assert action_stats["action"]["min"] == [-2.0] * 14
+    assert action_stats["action"]["max"] == [50.0] * 14
 
 
 def test_default_grpo_config_is_8gpu_resident_student(monkeypatch):

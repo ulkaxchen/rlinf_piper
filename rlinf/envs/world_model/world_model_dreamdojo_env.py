@@ -124,9 +124,7 @@ class DreamDojoEnv(BaseWorldEnv):
         self.guidance = cfg.get("guidance", 0)
         self.gen_height = cfg.get("height", 1440)
         self.gen_width = cfg.get("width", 640)
-        self.num_latent_conditional_frames = cfg.get(
-            "num_latent_conditional_frames", 1
-        )
+        self.num_latent_conditional_frames = cfg.get("num_latent_conditional_frames", 1)
         self.seed_base = self.seed
 
         # Action layout inside the 384-wide cosmos action vector.
@@ -228,6 +226,11 @@ class DreamDojoEnv(BaseWorldEnv):
         # frame is resized to (height, width) at rollout time.
         return NpyTrajectoryDatasetWrapper(
             cfg.initial_image_path,
+            # DreamDojo reset only consumes the first source image. The
+            # distilled student reads its remaining 35 actions directly and
+            # rolls generated frames into the causal cache. Avoid asking the
+            # dataset wrapper to decode unused target images unless KIR is on.
+            target_n_frames=4 if self.enable_kir else 0,
             enable_kir=self.enable_kir,
         )
 
@@ -398,9 +401,7 @@ class DreamDojoEnv(BaseWorldEnv):
             env_action = torch.from_numpy(env_action)
         env_action = env_action.float()
         chunk = env_action.shape[0]
-        model_action = torch.zeros(
-            chunk, self.model_action_dim, dtype=torch.float32
-        )
+        model_action = torch.zeros(chunk, self.model_action_dim, dtype=torch.float32)
         model_action[:, self.action_slot_start : self.action_slot_end] = env_action[
             :, : self.piper_action_dim
         ]
@@ -494,9 +495,7 @@ class DreamDojoEnv(BaseWorldEnv):
             states = states.detach().to(dtype=actions.dtype, device=actions.device)
             states = states[:, : self.piper_action_dim]
             if states.shape[-1] < self.piper_action_dim:
-                states = F.pad(
-                    states, (0, self.piper_action_dim - states.shape[-1])
-                )
+                states = F.pad(states, (0, self.piper_action_dim - states.shape[-1]))
 
         abs_actions = actions[..., : self.piper_action_dim]
         # Normalize absolute joint angles into DreamDojo's training space *before*
@@ -646,9 +645,7 @@ class DreamDojoEnv(BaseWorldEnv):
         if tuple(image.shape[1:3]) == self.image_size:
             return image
         x = image.permute(0, 3, 1, 2).float()  # [N, 3, H, W]
-        x = F.interpolate(
-            x, size=self.image_size, mode="bilinear", align_corners=False
-        )
+        x = F.interpolate(x, size=self.image_size, mode="bilinear", align_corners=False)
         return x.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)
 
     def get_video_frame_batches(self):
@@ -678,8 +675,7 @@ class DreamDojoEnv(BaseWorldEnv):
         if n_views > 1:
             height = full_image.shape[1]
             assert height % n_views == 0, (
-                f"generated height {height} not divisible by num_camera_views "
-                f"{n_views}"
+                f"generated height {height} not divisible by num_camera_views {n_views}"
             )
             vh = height // n_views
             views = [
@@ -775,7 +771,9 @@ class DreamDojoEnv(BaseWorldEnv):
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
         if past_dones.any() and self.auto_reset:
-            extracted_obs, infos = self._handle_auto_reset(past_dones, extracted_obs, {})
+            extracted_obs, infos = self._handle_auto_reset(
+                past_dones, extracted_obs, {}
+            )
         else:
             infos = {}
 
