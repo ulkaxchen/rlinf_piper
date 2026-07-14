@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORKSPACE=${WORKSPACE:-/project/peilab/srk/wmpo_workspace}
-REPO_PATH=${REPO_PATH:-${WORKSPACE}/RLinf}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+DEFAULT_REPO_PATH=$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)
+REPO_PATH=${REPO_PATH:-${DEFAULT_REPO_PATH}}
+REPO_PATH=$(cd -- "${REPO_PATH}" && pwd -P)
+WORKSPACE=${WORKSPACE:-$(dirname -- "${REPO_PATH}")}
 EMBODIED_PATH=${EMBODIED_PATH:-${REPO_PATH}/examples/embodiment}
 APPTAINER_IMAGE=${APPTAINER_IMAGE:-${WORKSPACE}/rlinf-dreamdojo-openpi-cu128.sandbox}
 APPTAINER_PYTHON=${APPTAINER_PYTHON:-/opt/venv/dreamdojo-openpi/bin/python}
 CONFIG_NAME=${CONFIG_NAME:-dreamdojo_piper_grpo}
+CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-${REPO_PATH}/checkpoints}
 
 # ---------------------------------------------------------------------------
 # Server deployment paths. Edit these defaults here, or export variables with
@@ -15,13 +19,17 @@ CONFIG_NAME=${CONFIG_NAME:-dreamdojo_piper_grpo}
 # ---------------------------------------------------------------------------
 DREAMDOJO_REPO_PATH=${DREAMDOJO_REPO_PATH:-${WORKSPACE}/DreamDojo}
 KAI0_REPO_PATH=${KAI0_REPO_PATH:-${WORKSPACE}/kai0}
-STUDENT_CKPT_PATH=${STUDENT_CKPT_PATH:-${REPO_PATH}/checkpoints/dreamdojo_distill_3000}
-COSMOS_TOKENIZER_PATH=${COSMOS_TOKENIZER_PATH:-${REPO_PATH}/checkpoints/cosmos-predict2.5-2B/tokenizer.pth}
-CR1_EMBEDDINGS_PATH=${CR1_EMBEDDINGS_PATH:-${REPO_PATH}/checkpoints/cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt}
-VLA_CKPT_PATH=${VLA_CKPT_PATH:-${KAI0_REPO_PATH}/checkpoints/pi05_piper_insert_mouse_battery_normal/piper_insert_mouse_battery_run2/30000_pytorch}
-REWARD_CKPT_PATH=${REWARD_CKPT_PATH:-${WORKSPACE}/piper_data/insert-mouse-battery/reward_model/full_weights.pt}
-RESET_DATA_PATH=${RESET_DATA_PATH:-${WORKSPACE}/piper_data/insert-mouse-battery/piper_initial_frames_36}
-ACTION_STATS_PATH=${ACTION_STATS_PATH:-${WORKSPACE}/piper_data/insert-mouse-battery/piper_insert_mouse_battery_lerobot/meta/stats.json}
+STUDENT_CKPT_PATH=${STUDENT_CKPT_PATH:-${CHECKPOINT_ROOT}/dreamdojo_student_distill/iter_000008000}
+COSMOS_TOKENIZER_PATH=${COSMOS_TOKENIZER_PATH:-${CHECKPOINT_ROOT}/cosmos-predict2.5-2B/tokenizer.pth}
+CR1_EMBEDDINGS_PATH=${CR1_EMBEDDINGS_PATH:-${CHECKPOINT_ROOT}/cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt}
+VLA_CKPT_PATH=${VLA_CKPT_PATH:-${CHECKPOINT_ROOT}/vla_policy/5000}
+REWARD_CKPT_PATH=${REWARD_CKPT_PATH:-${CHECKPOINT_ROOT}/reward_model/full_weights.pt}
+
+# These are dataset artifacts, not model checkpoints. The distilled student
+# needs one .npy trajectory per reset episode with at least 36 image/action
+# records, plus the source LeRobot action min/max statistics.
+RESET_DATA_PATH=${RESET_DATA_PATH:-}
+ACTION_STATS_PATH=${ACTION_STATS_PATH:-}
 
 # Comma-separated Apptainer bind specifications. Add server storage roots here
 # when the paths above are outside /project, for example /data:/data.
@@ -61,11 +69,22 @@ if [[ "${SKIP_PATH_CHECKS}" != "1" ]]; then
   if [[ "${STUDENT_CKPT_PATH}" != s3://* && "${STUDENT_CKPT_PATH}" != msc://* ]]; then
     [[ -f "${STUDENT_CKPT_PATH}/model/.metadata" ]] || { echo "Invalid student DCP root: ${STUDENT_CKPT_PATH}/model/.metadata is missing" >&2; exit 2; }
   fi
-  [[ -e "${VLA_CKPT_PATH}" ]] || { echo "Missing VLA checkpoint: ${VLA_CKPT_PATH}" >&2; exit 2; }
+  [[ -d "${VLA_CKPT_PATH}" ]] || { echo "Missing VLA checkpoint directory: ${VLA_CKPT_PATH}" >&2; exit 2; }
+  if [[ -f "${VLA_CKPT_PATH}/model_state_dict/full_weights.pt" || -f "${VLA_CKPT_PATH}/actor/model_state_dict/full_weights.pt" ]]; then
+    :
+  elif compgen -G "${VLA_CKPT_PATH}/*.safetensors" >/dev/null; then
+    :
+  else
+    echo "Missing VLA weights under ${VLA_CKPT_PATH}; expected full_weights.pt or *.safetensors" >&2
+    exit 2
+  fi
+  [[ -f "${VLA_CKPT_PATH}/assets/norm_stats.json" ]] || { echo "Missing OpenPI normalization stats: ${VLA_CKPT_PATH}/assets/norm_stats.json" >&2; exit 2; }
   [[ -f "${COSMOS_TOKENIZER_PATH}" ]] || { echo "Missing full Cosmos tokenizer checkpoint: ${COSMOS_TOKENIZER_PATH}" >&2; exit 2; }
   [[ -f "${CR1_EMBEDDINGS_PATH}" ]] || { echo "Missing CR1 embedding cache: ${CR1_EMBEDDINGS_PATH}" >&2; exit 2; }
   [[ -f "${REWARD_CKPT_PATH}" ]] || { echo "Missing reward checkpoint: ${REWARD_CKPT_PATH}" >&2; exit 2; }
+  [[ -n "${RESET_DATA_PATH}" ]] || { echo "RESET_DATA_PATH is not set; point it at the directory of 36-frame reset .npy trajectories" >&2; exit 2; }
   [[ -d "${RESET_DATA_PATH}" ]] || { echo "Missing 36-frame reset data: ${RESET_DATA_PATH}" >&2; exit 2; }
+  [[ -n "${ACTION_STATS_PATH}" ]] || { echo "ACTION_STATS_PATH is not set; point it at the Piper LeRobot meta/stats.json" >&2; exit 2; }
   [[ -f "${ACTION_STATS_PATH}" ]] || { echo "Missing action statistics: ${ACTION_STATS_PATH}" >&2; exit 2; }
 fi
 
@@ -97,11 +116,12 @@ HYDRA_PATH_OVERRIDES=(
 EOF
 )
 
-export WORKSPACE REPO_PATH EMBODIED_PATH HF_HOME_DIR DREAMDOJO_SITE DREAMDOJO_DISABLE_SAMPLE_TQDM RLINF_RAY_INCLUDE_DASHBOARD CONFIG_NAME LOG_DIR
+export WORKSPACE REPO_PATH EMBODIED_PATH CHECKPOINT_ROOT HF_HOME_DIR DREAMDOJO_SITE DREAMDOJO_DISABLE_SAMPLE_TQDM RLINF_RAY_INCLUDE_DASHBOARD CONFIG_NAME LOG_DIR
 export DREAMDOJO_REPO_PATH KAI0_REPO_PATH STUDENT_CKPT_PATH COSMOS_TOKENIZER_PATH CR1_EMBEDDINGS_PATH VLA_CKPT_PATH REWARD_CKPT_PATH RESET_DATA_PATH ACTION_STATS_PATH SKIP_PATH_CHECKS
 export APPTAINERENV_WORKSPACE="${WORKSPACE}"
 export APPTAINERENV_REPO_PATH="${REPO_PATH}"
 export APPTAINERENV_EMBODIED_PATH="${EMBODIED_PATH}"
+export APPTAINERENV_CHECKPOINT_ROOT="${CHECKPOINT_ROOT}"
 export APPTAINERENV_HF_HOME_DIR="${HF_HOME_DIR}"
 export APPTAINERENV_DREAMDOJO_SITE="${DREAMDOJO_SITE}"
 export APPTAINERENV_DREAMDOJO_DISABLE_SAMPLE_TQDM="${DREAMDOJO_DISABLE_SAMPLE_TQDM}"
@@ -123,6 +143,7 @@ export APPTAINERENV_SKIP_PATH_CHECKS="${SKIP_PATH_CHECKS}"
 echo "Using image: ${APPTAINER_IMAGE}"
 echo "Using config: ${CONFIG_NAME}"
 echo "Using log dir: ${LOG_DIR}"
+echo "Checkpoint root: ${CHECKPOINT_ROOT}"
 echo "Student DCP: ${STUDENT_CKPT_PATH}"
 echo "Cosmos tokenizer: ${COSMOS_TOKENIZER_PATH}"
 echo "CR1 cache: ${CR1_EMBEDDINGS_PATH}"
@@ -140,12 +161,29 @@ APPTAINER_CMD=(
   bash -lc "${INNER_CMD}" bash "$@"
 )
 
-if [[ -n "${JOB_ID:-}" ]]; then
-  echo "Launching through srun job ${JOB_ID}"
-  srun --jobid="${JOB_ID}" --overlap --nodes=1 --ntasks=1 \
+[[ -e "${APPTAINER_IMAGE}" ]] || { echo "Missing Apptainer image: ${APPTAINER_IMAGE}" >&2; exit 2; }
+
+LAUNCH_JOB_ID=${JOB_ID:-}
+if [[ -z "${LAUNCH_JOB_ID}" && -n "${SLURM_JOB_ID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then
+  LAUNCH_JOB_ID=${SLURM_JOB_ID}
+fi
+
+if [[ -n "${LAUNCH_JOB_ID}" ]]; then
+  echo "Launching through srun job ${LAUNCH_JOB_ID}"
+  srun --jobid="${LAUNCH_JOB_ID}" --overlap --nodes=1 --ntasks=1 \
     --gres="${GRES:-gpu:8}" --cpus-per-task="${CPUS_PER_TASK:-16}" \
     bash -lc "module load apptainer && exec \"\$@\"" bash "${APPTAINER_CMD[@]}"
 else
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "${CUDA_VISIBLE_DEVICES}" != "NoDevFiles" ]]; then
+    VISIBLE_GPU_COUNT=$(awk -F, '{print NF}' <<<"${CUDA_VISIBLE_DEVICES}")
+  else
+    VISIBLE_GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l || true)
+  fi
+  VISIBLE_GPU_COUNT=${VISIBLE_GPU_COUNT//[[:space:]]/}
+  if [[ "${VISIBLE_GPU_COUNT}" != "8" ]]; then
+    echo "Expected exactly 8 visible GPUs, found ${VISIBLE_GPU_COUNT:-0}. Do not run on a login node; enter an 8-GPU Slurm step or set JOB_ID." >&2
+    exit 2
+  fi
   module load apptainer
   "${APPTAINER_CMD[@]}"
 fi
