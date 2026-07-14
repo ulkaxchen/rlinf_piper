@@ -75,7 +75,7 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         self._student_action_history: torch.Tensor | None = None
 
     def _validate_distilled_student_inputs(self) -> None:
-        """Validate that the configured checkpoint is a student DCP root."""
+        """Validate the full student DCP and its external Cosmos assets."""
         config_file = str(self.cfg.config_file)
         if "interactive/configs/" not in config_file:
             raise ValueError(
@@ -98,14 +98,25 @@ class DreamDojoStudentEnv(DreamDojoEnv):
                 f".pt file or its model/ child: {checkpoint}"
             )
         if not checkpoint.startswith(("s3://", "msc://")):
-            metadata = os.path.join(
-                os.path.expanduser(checkpoint), "model", ".metadata"
-            )
+            model_dir = os.path.join(os.path.expanduser(checkpoint), "model")
+            metadata = os.path.join(model_dir, ".metadata")
             if not os.path.isfile(metadata):
                 raise FileNotFoundError(
                     "DreamDojo student checkpoint metadata not found at "
                     f"{metadata}. Pass the DCP root directory."
                 )
+            self._validate_complete_dcp_model(model_dir)
+
+        tokenizer_path = self.cfg.get("cosmos_tokenizer_path", None)
+        if tokenizer_path in (None, "", "null"):
+            raise ValueError(
+                "DreamDojo student requires cosmos_tokenizer_path pointing to "
+                "the full Cosmos-Predict2.5-2B tokenizer.pth file."
+            )
+        if not os.path.isfile(os.path.expanduser(str(tokenizer_path))):
+            raise FileNotFoundError(
+                f"DreamDojo student Cosmos tokenizer not found: {tokenizer_path}"
+            )
 
         embedding_path = self.cfg.get(
             "cr1_embeddings_path",
@@ -117,6 +128,54 @@ class DreamDojoStudentEnv(DreamDojoEnv):
             raise FileNotFoundError(
                 f"DreamDojo student CR1 embedding cache not found: {embedding_path}"
             )
+
+    @staticmethod
+    def _validate_complete_dcp_model(model_dir: str) -> None:
+        """Check that every shard range referenced by DCP metadata is present."""
+        from torch.distributed.checkpoint import FileSystemReader
+
+        try:
+            metadata = FileSystemReader(model_dir).read_metadata()
+        except Exception as exc:
+            raise ValueError(
+                f"Could not read DreamDojo student DCP metadata in {model_dir}."
+            ) from exc
+
+        required_sizes: dict[str, int] = {}
+        for storage_info in metadata.storage_data.values():
+            relative_path = storage_info.relative_path
+            required_sizes[relative_path] = max(
+                required_sizes.get(relative_path, 0),
+                storage_info.offset + storage_info.length,
+            )
+
+        incomplete = []
+        for relative_path, required_size in sorted(required_sizes.items()):
+            shard_path = os.path.join(model_dir, relative_path)
+            actual_size = (
+                os.path.getsize(shard_path) if os.path.isfile(shard_path) else 0
+            )
+            if actual_size < required_size:
+                incomplete.append(
+                    f"{relative_path} ({actual_size}/{required_size} bytes)"
+                )
+        if incomplete:
+            raise FileNotFoundError(
+                "DreamDojo student DCP is incomplete; missing or truncated model "
+                f"shards: {', '.join(incomplete)}"
+            )
+
+    def _student_checkpoint_experiment_opts(self) -> list[str]:
+        """Build Hydra overrides for inference-only student construction."""
+        tokenizer_path = os.path.expanduser(str(self.cfg.cosmos_tokenizer_path))
+        experiment_opts = [
+            "model.config.net_fake_score=null",
+            # ``vae_pth`` is not declared in the registered tokenizer node, so
+            # Hydra needs ``+`` to add the local checkpoint path.
+            f"+model.config.tokenizer.vae_pth={tokenizer_path}",
+        ]
+        experiment_opts.extend(self.cfg.get("student_experiment_opts", []))
+        return experiment_opts
 
     def _build_pipeline(self):
         """Load only the inference student from the self-forcing DCP."""
@@ -137,8 +196,7 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         # The self-forcing training experiment defines another 2B fake-score
         # network. It is not used by inference, so disable it before model
         # construction instead of replicating it on every data-parallel GPU.
-        experiment_opts = ["model.config.net_fake_score=null"]
-        experiment_opts.extend(self.cfg.get("student_experiment_opts", []))
+        experiment_opts = self._student_checkpoint_experiment_opts()
         original_loader = action_video2world.load_model_from_checkpoint
 
         def _load_student_checkpoint(*args, **kwargs):

@@ -203,9 +203,15 @@ def test_student_frame_rewards_expand_to_twelve_policy_actions():
 
 
 def test_student_checkpoint_validation_accepts_dcp_root(tmp_path):
+    import torch.distributed.checkpoint as dcp
+
     checkpoint = tmp_path / "dreamdojo_distill_3000"
-    (checkpoint / "model").mkdir(parents=True)
-    (checkpoint / "model" / ".metadata").touch()
+    dcp.save(
+        {"net_ema": {"weight": torch.ones(1)}},
+        checkpoint_id=checkpoint / "model",
+    )
+    tokenizer = tmp_path / "tokenizer.pth"
+    tokenizer.touch()
     embedding = tmp_path / "cr1.pt"
     embedding.touch()
 
@@ -219,6 +225,7 @@ def test_student_checkpoint_validation_accepts_dcp_root(tmp_path):
                 "cosmos_predict2p5_2B_action_gr00t_pretrain_self_forcing_no_s3"
             ),
             "dreamdojo_ckpt_path": str(checkpoint),
+            "cosmos_tokenizer_path": str(tokenizer),
             "cr1_embeddings_path": str(embedding),
         }
     )
@@ -228,6 +235,28 @@ def test_student_checkpoint_validation_accepts_dcp_root(tmp_path):
     env.cfg.dreamdojo_ckpt_path = str(checkpoint / "model")
     with pytest.raises(ValueError, match="DCP checkpoint root"):
         env._validate_distilled_student_inputs()
+
+    env.cfg.dreamdojo_ckpt_path = str(checkpoint)
+    next((checkpoint / "model").glob("*.distcp")).unlink()
+    with pytest.raises(FileNotFoundError, match="DCP is incomplete"):
+        env._validate_distilled_student_inputs()
+
+
+def test_student_checkpoint_opts_add_explicit_full_tokenizer(tmp_path):
+    env = object.__new__(DreamDojoStudentEnv)
+    tokenizer = tmp_path / "tokenizer.pth"
+    env.cfg = OmegaConf.create(
+        {
+            "cosmos_tokenizer_path": str(tokenizer),
+            "student_experiment_opts": ["model.config.fsdp_shard_size=1"],
+        }
+    )
+
+    assert env._student_checkpoint_experiment_opts() == [
+        "model.config.net_fake_score=null",
+        f"+model.config.tokenizer.vae_pth={tokenizer}",
+        "model.config.fsdp_shard_size=1",
+    ]
 
 
 def test_piper_reset_export_contains_36_absolute_actions(tmp_path, monkeypatch):
@@ -304,6 +333,9 @@ def test_default_grpo_config_is_8gpu_resident_student(monkeypatch):
     assert cfg.env.train.initial_image_path.endswith("piper_initial_frames_36")
     assert cfg.env.train.cr1_embeddings_path.endswith(
         "cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt"
+    )
+    assert cfg.env.train.cosmos_tokenizer_path.endswith(
+        "cosmos-predict2.5-2B/tokenizer.pth"
     )
 
     rollout_samples = (

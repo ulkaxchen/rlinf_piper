@@ -16,6 +16,7 @@ CONFIG_NAME=${CONFIG_NAME:-dreamdojo_piper_grpo}
 DREAMDOJO_REPO_PATH=${DREAMDOJO_REPO_PATH:-${WORKSPACE}/DreamDojo}
 KAI0_REPO_PATH=${KAI0_REPO_PATH:-${WORKSPACE}/kai0}
 STUDENT_CKPT_PATH=${STUDENT_CKPT_PATH:-${REPO_PATH}/checkpoints/dreamdojo_distill_3000}
+COSMOS_TOKENIZER_PATH=${COSMOS_TOKENIZER_PATH:-${REPO_PATH}/checkpoints/cosmos-predict2.5-2B/tokenizer.pth}
 CR1_EMBEDDINGS_PATH=${CR1_EMBEDDINGS_PATH:-${REPO_PATH}/checkpoints/cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt}
 VLA_CKPT_PATH=${VLA_CKPT_PATH:-${KAI0_REPO_PATH}/checkpoints/pi05_piper_insert_mouse_battery_normal/piper_insert_mouse_battery_run2/30000_pytorch}
 REWARD_CKPT_PATH=${REWARD_CKPT_PATH:-${WORKSPACE}/piper_data/insert-mouse-battery/reward_model/full_weights.pt}
@@ -61,6 +62,7 @@ if [[ "${SKIP_PATH_CHECKS}" != "1" ]]; then
     [[ -f "${STUDENT_CKPT_PATH}/model/.metadata" ]] || { echo "Invalid student DCP root: ${STUDENT_CKPT_PATH}/model/.metadata is missing" >&2; exit 2; }
   fi
   [[ -e "${VLA_CKPT_PATH}" ]] || { echo "Missing VLA checkpoint: ${VLA_CKPT_PATH}" >&2; exit 2; }
+  [[ -f "${COSMOS_TOKENIZER_PATH}" ]] || { echo "Missing full Cosmos tokenizer checkpoint: ${COSMOS_TOKENIZER_PATH}" >&2; exit 2; }
   [[ -f "${CR1_EMBEDDINGS_PATH}" ]] || { echo "Missing CR1 embedding cache: ${CR1_EMBEDDINGS_PATH}" >&2; exit 2; }
   [[ -f "${REWARD_CKPT_PATH}" ]] || { echo "Missing reward checkpoint: ${REWARD_CKPT_PATH}" >&2; exit 2; }
   [[ -d "${RESET_DATA_PATH}" ]] || { echo "Missing 36-frame reset data: ${RESET_DATA_PATH}" >&2; exit 2; }
@@ -74,6 +76,8 @@ HYDRA_PATH_OVERRIDES=(
   env.eval.dreamdojo_repo_path="${DREAMDOJO_REPO_PATH}"
   env.train.dreamdojo_ckpt_path="${STUDENT_CKPT_PATH}"
   env.eval.dreamdojo_ckpt_path="${STUDENT_CKPT_PATH}"
+  env.train.cosmos_tokenizer_path="${COSMOS_TOKENIZER_PATH}"
+  env.eval.cosmos_tokenizer_path="${COSMOS_TOKENIZER_PATH}"
   env.train.cr1_embeddings_path="${CR1_EMBEDDINGS_PATH}"
   env.eval.cr1_embeddings_path="${CR1_EMBEDDINGS_PATH}"
   env.train.reward_model.model_path="${REWARD_CKPT_PATH}"
@@ -94,7 +98,7 @@ EOF
 )
 
 export WORKSPACE REPO_PATH EMBODIED_PATH HF_HOME_DIR DREAMDOJO_SITE DREAMDOJO_DISABLE_SAMPLE_TQDM RLINF_RAY_INCLUDE_DASHBOARD CONFIG_NAME LOG_DIR
-export DREAMDOJO_REPO_PATH KAI0_REPO_PATH STUDENT_CKPT_PATH CR1_EMBEDDINGS_PATH VLA_CKPT_PATH REWARD_CKPT_PATH RESET_DATA_PATH ACTION_STATS_PATH SKIP_PATH_CHECKS
+export DREAMDOJO_REPO_PATH KAI0_REPO_PATH STUDENT_CKPT_PATH COSMOS_TOKENIZER_PATH CR1_EMBEDDINGS_PATH VLA_CKPT_PATH REWARD_CKPT_PATH RESET_DATA_PATH ACTION_STATS_PATH SKIP_PATH_CHECKS
 export APPTAINERENV_WORKSPACE="${WORKSPACE}"
 export APPTAINERENV_REPO_PATH="${REPO_PATH}"
 export APPTAINERENV_EMBODIED_PATH="${EMBODIED_PATH}"
@@ -108,6 +112,7 @@ export APPTAINERENV_APPTAINER_PYTHON="${APPTAINER_PYTHON}"
 export APPTAINERENV_DREAMDOJO_REPO_PATH="${DREAMDOJO_REPO_PATH}"
 export APPTAINERENV_KAI0_REPO_PATH="${KAI0_REPO_PATH}"
 export APPTAINERENV_STUDENT_CKPT_PATH="${STUDENT_CKPT_PATH}"
+export APPTAINERENV_COSMOS_TOKENIZER_PATH="${COSMOS_TOKENIZER_PATH}"
 export APPTAINERENV_CR1_EMBEDDINGS_PATH="${CR1_EMBEDDINGS_PATH}"
 export APPTAINERENV_VLA_CKPT_PATH="${VLA_CKPT_PATH}"
 export APPTAINERENV_REWARD_CKPT_PATH="${REWARD_CKPT_PATH}"
@@ -119,6 +124,7 @@ echo "Using image: ${APPTAINER_IMAGE}"
 echo "Using config: ${CONFIG_NAME}"
 echo "Using log dir: ${LOG_DIR}"
 echo "Student DCP: ${STUDENT_CKPT_PATH}"
+echo "Cosmos tokenizer: ${COSMOS_TOKENIZER_PATH}"
 echo "CR1 cache: ${CR1_EMBEDDINGS_PATH}"
 echo "VLA checkpoint: ${VLA_CKPT_PATH}"
 echo "Reward checkpoint: ${REWARD_CKPT_PATH}"

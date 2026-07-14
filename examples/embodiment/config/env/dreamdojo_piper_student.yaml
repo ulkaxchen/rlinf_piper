@@ -35,10 +35,14 @@ enable_offload: False
 
 dreamdojo_repo_path: /project/peilab/srk/wmpo_workspace/DreamDojo
 dreamdojo_backend: distilled_student
-# DCP root; the loader reads the model/ child and its .metadata file.
+# Full DCP root. Keep every file under model/; the loader reads the EMA student
+# directly from the DCP instead of a single-GPU EMA-only/BF16 export.
 dreamdojo_ckpt_path: /project/peilab/srk/wmpo_workspace/RLinf/checkpoints/dreamdojo_distill_3000
 experiment: cosmos_predict2p5_2B_action_gr00t_pretrain_self_forcing_no_s3
 config_file: cosmos_predict2/_src/predict2/interactive/configs/config_distill.py
+# Full upstream Wan2.1 VAE tokenizer checkpoint. This explicit path keeps
+# offline server runs independent of the Hugging Face cache layout.
+cosmos_tokenizer_path: /project/peilab/srk/wmpo_workspace/RLinf/checkpoints/cosmos-predict2.5-2B/tokenizer.pth
 cr1_embeddings_path: /project/peilab/srk/wmpo_workspace/RLinf/checkpoints/cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt
 s3_credential_path: /project/peilab/srk/wmpo_workspace/DreamDojo/credentials/s3_checkpoint.secret
 dreamdojo_context_parallel_size: 1
