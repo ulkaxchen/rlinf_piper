@@ -12,7 +12,7 @@ PYTHON_BIN=${PYTHON_BIN:-${REPO_PATH}/requirements/dreamdojo-piper/.venv/bin/pyt
 
 # Server deployment defaults. Export the same variable before launch to
 # override a path without editing this file.
-DREAMDOJO_REPO_PATH=${DREAMDOJO_REPO_PATH:-/project/peilab/srk/wmpo_workspace/Dreamdojo}
+DREAMDOJO_REPO_PATH=${DREAMDOJO_REPO_PATH:-/project/peilab/srk/wmpo_workspace/DreamDojo}
 KAI0_REPO_PATH=${KAI0_REPO_PATH:-/project/peilab/srk/wmpo_workspace/kai0}
 PIPER_DATASET_PATH=${PIPER_DATASET_PATH:-/project/peilab/yuyangcheng/dreamdojo-distill/datasets/piper_insert_mouse_battery_lerobot}
 
