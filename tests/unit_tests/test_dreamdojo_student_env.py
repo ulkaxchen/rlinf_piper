@@ -1,5 +1,6 @@
+import sys
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -16,9 +17,9 @@ from rlinf.envs.world_model.world_model_dreamdojo_student_env import (
 )
 
 
-def _make_env_without_models() -> DreamDojoStudentEnv:
+def _make_env_without_models(num_envs: int = 1) -> DreamDojoStudentEnv:
     env = object.__new__(DreamDojoStudentEnv)
-    env.num_envs = 1
+    env.num_envs = num_envs
     env.chunk = 12
     env.action_stride = 3
     env.gen_frames = 4
@@ -29,6 +30,7 @@ def _make_env_without_models() -> DreamDojoStudentEnv:
     env.policy_action_format = "delta"
     env.student_actions_per_latent = 4
     env.student_cache_latents = 3
+    env.student_condition_fps = 4.0
     env.student_context_pixel_frames = 9
     env.student_history_actions = 8
     env.student_bootstrap_enabled = True
@@ -42,12 +44,16 @@ def _make_env_without_models() -> DreamDojoStudentEnv:
     env.gen_height = 2
     env.gen_width = 2
     env.num_inference_steps = 4
-    env.current_obs = torch.zeros(1, 2, 2, 3, dtype=torch.uint8)
-    env.current_states = torch.zeros(1, 14)
+    env.current_obs = torch.zeros(num_envs, 2, 2, 3, dtype=torch.uint8)
+    env.current_states = torch.zeros(num_envs, 14)
     env._last_action_state = None
-    env._last_reset_episode_indices = np.array([0], dtype=np.int64)
-    env._student_condition_frames = torch.zeros(1, 3, 9, 2, 2, dtype=torch.uint8)
-    env._student_action_history = torch.zeros(1, 8, 384)
+    env._last_reset_episode_indices = np.arange(num_envs, dtype=np.int64)
+    env._student_condition_frames = torch.zeros(num_envs, 3, 9, 2, 2, dtype=torch.uint8)
+    env._student_action_history = torch.zeros(num_envs, 8, 384)
+    env.task_descriptions = [f"task {idx}" for idx in range(num_envs)]
+    env._student_text_embeddings_gpu = None
+    env._student_text_mask_gpu = None
+    env._student_text_prompts = ()
     env._clear_accelerator_cache = lambda: None
     return env
 
@@ -74,6 +80,215 @@ def test_student_temporal_contract_matches_checkpoint():
     env.gen_frames = 12
     with pytest.raises(ValueError, match="generate one latent"):
         env._validate_student_temporal_contract()
+
+
+def test_student_encodes_episode_instructions_with_native_reason1():
+    env = _make_env_without_models(num_envs=2)
+    env.task_descriptions = ["insert mouse battery", "close the drawer"]
+    calls = []
+
+    class _TextEncoder:
+        def compute_text_embeddings_online(self, data_batch, input_caption_key):
+            calls.append((data_batch, input_caption_key))
+            return torch.stack(
+                [
+                    torch.full((3, 4), 1.0),
+                    torch.full((3, 4), 2.0),
+                ]
+            )
+
+    env.pipe = SimpleNamespace(
+        model=SimpleNamespace(
+            text_encoder=_TextEncoder(),
+            input_caption_key="ai_caption",
+            tensor_kwargs={"device": torch.device("cpu"), "dtype": torch.bfloat16},
+        ),
+        t5_text_embeddings_cpu=torch.zeros(1, 3, 4),
+    )
+
+    env._encode_student_episode_instructions()
+
+    assert len(calls) == 1
+    assert calls[0][1] == "ai_caption"
+    assert calls[0][0] == {
+        "ai_caption": ["insert mouse battery", "close the drawer"],
+        "images": None,
+    }
+    assert env._student_text_embeddings_gpu.shape == (2, 3, 4)
+    assert env._student_text_embeddings_gpu.dtype == torch.bfloat16
+    assert env._student_text_mask_gpu.shape == (2, 3)
+    assert torch.all(env._student_text_mask_gpu == 1)
+
+    first_batch = {}
+    second_batch = {}
+    env._inject_student_text_condition(first_batch, 0)
+    env._inject_student_text_condition(second_batch, 1)
+    assert first_batch["t5_text_embeddings"].shape == (1, 3, 4)
+    assert second_batch["t5_text_embeddings"].shape == (1, 3, 4)
+    assert torch.all(first_batch["t5_text_embeddings"] == 1)
+    assert torch.all(second_batch["t5_text_embeddings"] == 2)
+    assert first_batch["t5_text_mask"].shape == (1, 3)
+
+
+def test_student_rejects_wrong_online_reason1_batch_size():
+    env = _make_env_without_models(num_envs=2)
+    env.pipe = SimpleNamespace(
+        model=SimpleNamespace(
+            text_encoder=SimpleNamespace(
+                compute_text_embeddings_online=lambda **_: torch.zeros(1, 3, 4)
+            ),
+            input_caption_key="ai_caption",
+            tensor_kwargs={"device": torch.device("cpu"), "dtype": torch.bfloat16},
+        ),
+        t5_text_embeddings_cpu=torch.zeros(1, 3, 4),
+    )
+
+    with pytest.raises(RuntimeError, match="wrong embedding batch size"):
+        env._encode_student_episode_instructions()
+
+
+def test_student_bootstrap_uses_matching_online_reason1_embedding():
+    env = _make_env_without_models(num_envs=2)
+    env._student_text_prompts = tuple(env.task_descriptions)
+    env._student_text_embeddings_gpu = torch.stack(
+        [torch.full((3, 4), 1.0), torch.full((3, 4), 2.0)]
+    )
+    env._student_text_mask_gpu = torch.ones(2, 3)
+    compatibility_embedding = torch.zeros(1, 3, 4)
+    seen_embeddings = []
+
+    def _fake_generate_action_streaming(**_):
+        seen_embeddings.append(env.pipe.t5_text_embeddings_cpu.clone())
+        return torch.zeros(1, 3, 13, 2, 2)
+
+    env.pipe = SimpleNamespace(
+        t5_text_embeddings_cpu=compatibility_embedding,
+        generate_action_streaming=_fake_generate_action_streaming,
+    )
+    initial = torch.zeros(3, 2, 2, dtype=torch.uint8)
+    actions = torch.zeros(12, 384)
+
+    env._generate_student_bootstrap_video(0, initial, actions, seed=0)
+    assert env.pipe.t5_text_embeddings_cpu is compatibility_embedding
+    env._generate_student_bootstrap_video(1, initial, actions, seed=1)
+    assert env.pipe.t5_text_embeddings_cpu is compatibility_embedding
+
+    assert len(seen_embeddings) == 2
+    assert seen_embeddings[0].shape == (1, 3, 4)
+    assert torch.all(seen_embeddings[0] == 1)
+    assert torch.all(seen_embeddings[1] == 2)
+
+    def _fail_generate_action_streaming(**_):
+        raise RuntimeError("warmup failed")
+
+    env.pipe.generate_action_streaming = _fail_generate_action_streaming
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        env._generate_student_bootstrap_video(0, initial, actions, seed=2)
+    assert env.pipe.t5_text_embeddings_cpu is compatibility_embedding
+
+
+def test_student_steady_condition_uses_matching_online_reason1_embedding(
+    monkeypatch,
+):
+    action_module = ModuleType("action_conditioner")
+    action_module.ActionConditionedCondition = lambda **kwargs: kwargs
+    conditioner_module = ModuleType("conditioner")
+    conditioner_module.DataType = SimpleNamespace(VIDEO="video")
+    monkeypatch.setitem(
+        sys.modules,
+        ("cosmos_predict2._src.predict2.action.configs.action_conditioned.conditioner"),
+        action_module,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "cosmos_predict2._src.predict2.conditioner",
+        conditioner_module,
+    )
+
+    env = _make_env_without_models(num_envs=2)
+    env._student_text_prompts = tuple(env.task_descriptions)
+    env._student_text_embeddings_gpu = torch.stack(
+        [torch.full((3, 4), 1.0), torch.full((3, 4), 2.0)]
+    )
+    env._student_text_mask_gpu = torch.ones(2, 3)
+    captured_batches = []
+
+    class _Condition:
+        def edit_data_type(self, _):
+            return self
+
+        def set_video_condition(self, **_):
+            return self
+
+        def to_dict(self):
+            return {}
+
+    def _get_data_and_condition(data_batch):
+        captured_batches.append(data_batch.copy())
+        return None, torch.zeros(1, 1, 4, 1, 1), _Condition(), None
+
+    model = SimpleNamespace(
+        tensor_kwargs={"device": torch.device("cpu"), "dtype": torch.bfloat16},
+        _normalize_video_databatch_inplace=lambda _: None,
+        _augment_image_dim_inplace=lambda _: None,
+        get_data_and_condition=_get_data_and_condition,
+    )
+    env.pipe = SimpleNamespace(
+        model=model,
+        _prepare_data_batch=lambda **_: {"video": torch.zeros(1, dtype=torch.float32)},
+    )
+    current_actions = torch.zeros(4, 384)
+
+    env._build_student_condition(0, current_actions)
+    env._build_student_condition(1, current_actions)
+
+    assert captured_batches[0]["t5_text_embeddings"].shape == (1, 3, 4)
+    assert torch.all(captured_batches[0]["t5_text_embeddings"] == 1)
+    assert torch.all(captured_batches[1]["t5_text_embeddings"] == 2)
+    assert captured_batches[0]["t5_text_mask"].shape == (1, 3)
+
+
+def test_student_reset_encodes_new_instructions_before_warmup(monkeypatch):
+    env = _make_env_without_models(num_envs=2)
+    instruction_batches = iter(
+        [
+            ["task A", "task B"],
+            ["task C", "task D"],
+        ]
+    )
+    events = []
+
+    def _fake_base_reset(self, *args, **kwargs):
+        del args, kwargs
+        self.task_descriptions = next(instruction_batches)
+        events.append(("base", tuple(self.task_descriptions)))
+        return {"obs": "base"}, {}
+
+    def _fake_encode(self):
+        self._student_text_prompts = tuple(self.task_descriptions)
+        self._student_text_embeddings_gpu = torch.zeros(2, 3, 4)
+        self._student_text_mask_gpu = torch.ones(2, 3)
+        events.append(("encode", self._student_text_prompts))
+
+    def _fake_warmup(self):
+        events.append(("warmup", self._student_text_prompts))
+
+    monkeypatch.setattr(DreamDojoEnv, "reset", _fake_base_reset)
+    env._encode_student_episode_instructions = MethodType(_fake_encode, env)
+    env._bootstrap_student_context = MethodType(_fake_warmup, env)
+    env._wrap_obs = lambda: {"obs": "student"}
+
+    env.reset()
+    env.reset()
+
+    assert events == [
+        ("base", ("task A", "task B")),
+        ("encode", ("task A", "task B")),
+        ("warmup", ("task A", "task B")),
+        ("base", ("task C", "task D")),
+        ("encode", ("task C", "task D")),
+        ("warmup", ("task C", "task D")),
+    ]
 
 
 def test_student_chunk_generates_four_frames_and_preserves_causal_history():
@@ -138,8 +353,9 @@ def test_student_bootstrap_uses_36_demo_actions_without_exposing_reward():
     )
     captured_actions = []
 
-    def _fake_bootstrap(self, initial_frame, model_actions, seed):
+    def _fake_bootstrap(self, env_idx, initial_frame, model_actions, seed):
         del self, initial_frame, seed
+        assert env_idx == 0
         captured_actions.append(model_actions.clone())
         frame_values = torch.linspace(-1.0, 1.0, 13).view(1, 1, 13, 1, 1)
         return frame_values.expand(1, 3, 13, 2, 2).clone()
@@ -204,6 +420,7 @@ def test_student_frame_rewards_expand_to_twelve_policy_actions():
 
 def test_student_checkpoint_validation_accepts_dcp_root(tmp_path):
     import torch.distributed.checkpoint as dcp
+    from safetensors.torch import save_file
 
     checkpoint = tmp_path / "dreamdojo_distill_3000"
     dcp.save(
@@ -214,6 +431,32 @@ def test_student_checkpoint_validation_accepts_dcp_root(tmp_path):
     tokenizer.touch()
     embedding = tmp_path / "cr1.pt"
     embedding.touch()
+    reason1 = tmp_path / "Cosmos-Reason1-7B"
+    reason1.mkdir()
+    for name in (
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.json",
+        "preprocessor_config.json",
+    ):
+        (reason1 / name).write_text("{}", encoding="utf-8")
+    (reason1 / "config.json").write_text(
+        (
+            '{"model_type":"qwen2_5_vl","hidden_size":3584,'
+            '"num_hidden_layers":28,"vocab_size":152064}'
+        ),
+        encoding="utf-8",
+    )
+    reason1_shard = reason1 / "model-00001-of-00001.safetensors"
+    save_file({"model.weight": torch.ones(1)}, reason1_shard)
+    (reason1 / "model.safetensors.index.json").write_text(
+        (
+            '{"metadata":{"total_size":4},'
+            '"weight_map":{"model.weight":"model-00001-of-00001.safetensors"}}'
+        ),
+        encoding="utf-8",
+    )
 
     env = object.__new__(DreamDojoStudentEnv)
     env.cfg = OmegaConf.create(
@@ -226,11 +469,20 @@ def test_student_checkpoint_validation_accepts_dcp_root(tmp_path):
             ),
             "dreamdojo_ckpt_path": str(checkpoint),
             "cosmos_tokenizer_path": str(tokenizer),
+            "cosmos_reason1_path": str(reason1),
             "cr1_embeddings_path": str(embedding),
         }
     )
 
     env._validate_distilled_student_inputs()
+
+    reason1_shard.unlink()
+    with pytest.raises(FileNotFoundError, match="weight shards"):
+        env._validate_distilled_student_inputs()
+    reason1_shard.write_bytes(b"x")
+    with pytest.raises(FileNotFoundError, match="truncated"):
+        env._validate_distilled_student_inputs()
+    save_file({"model.weight": torch.ones(1)}, reason1_shard)
 
     env.cfg.dreamdojo_ckpt_path = str(checkpoint / "model")
     with pytest.raises(ValueError, match="DCP checkpoint root"):
@@ -245,9 +497,11 @@ def test_student_checkpoint_validation_accepts_dcp_root(tmp_path):
 def test_student_checkpoint_opts_add_explicit_full_tokenizer(tmp_path):
     env = object.__new__(DreamDojoStudentEnv)
     tokenizer = tmp_path / "tokenizer.pth"
+    reason1 = tmp_path / "Cosmos-Reason1-7B"
     env.cfg = OmegaConf.create(
         {
             "cosmos_tokenizer_path": str(tokenizer),
+            "cosmos_reason1_path": str(reason1),
             "student_experiment_opts": ["model.config.fsdp_shard_size=1"],
         }
     )
@@ -256,6 +510,12 @@ def test_student_checkpoint_opts_add_explicit_full_tokenizer(tmp_path):
         "model.config.net_fake_score=null",
         f"+model.config.tokenizer.vae_pth={tokenizer}",
         "model.config.fsdp_shard_size=1",
+        "model.config.text_encoder_config.compute_online=true",
+        f"model.config.text_encoder_config.ckpt_path={reason1}",
+        (
+            "model.config.text_encoder_config.model_config.tokenizer."
+            f"cache_dir={reason1}"
+        ),
     ]
 
 
@@ -343,6 +603,7 @@ def test_piper_reset_export_contains_36_absolute_actions(tmp_path, monkeypatch):
     assert trajectory[0]["image"].shape == (6, 2, 3)
     assert "image" not in trajectory[-1]
     assert trajectory[0]["abs_action"].shape == (14,)
+    assert all(frame["instruction"] == "insert the battery" for frame in trajectory)
     assert np.array_equal(
         trajectory[-1]["abs_action"], np.full(14, 35, dtype=np.float32)
     )
@@ -372,6 +633,8 @@ def test_default_grpo_config_is_8gpu_resident_student(monkeypatch):
     assert cfg.env.train.cr1_embeddings_path.endswith(
         "cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt"
     )
+    assert cfg.env.train.cosmos_reason1_path.endswith("Cosmos-Reason1-7B")
+    assert cfg.env.eval.cosmos_reason1_path == cfg.env.train.cosmos_reason1_path
     assert cfg.env.train.cosmos_tokenizer_path.endswith(
         "cosmos-predict2.5-2B/tokenizer.pth"
     )

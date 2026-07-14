@@ -18,6 +18,7 @@ PIPER_DATASET_PATH=${PIPER_DATASET_PATH:-/project/peilab/yuyangcheng/dreamdojo-d
 
 STUDENT_CKPT_PATH=${STUDENT_CKPT_PATH:-${CHECKPOINT_ROOT}/dreamdojo_student_distill/iter_000008000}
 COSMOS_TOKENIZER_PATH=${COSMOS_TOKENIZER_PATH:-${CHECKPOINT_ROOT}/cosmos-predict2.5-2B/tokenizer.pth}
+COSMOS_REASON1_PATH=${COSMOS_REASON1_PATH:-${CHECKPOINT_ROOT}/Cosmos-Reason1-7B}
 CR1_EMBEDDINGS_PATH=${CR1_EMBEDDINGS_PATH:-${CHECKPOINT_ROOT}/cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt}
 VLA_CKPT_PATH=${VLA_CKPT_PATH:-${CHECKPOINT_ROOT}/vla_policy/5000}
 REWARD_CKPT_PATH=${REWARD_CKPT_PATH:-${CHECKPOINT_ROOT}/reward_model/full_weights.pt}
@@ -44,6 +45,7 @@ unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
 export HF_HOME="${HF_HOME_DIR}"
 export HUGGINGFACE_HUB_CACHE="${HF_HOME_DIR}/hub"
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export REPO_PATH EMBODIED_PATH DREAMDOJO_REPO_PATH KAI0_REPO_PATH
 export DREAMDOJO_DISABLE_SAMPLE_TQDM
 export RLINF_RAY_INCLUDE_DASHBOARD
@@ -96,6 +98,94 @@ if [[ "${SKIP_PATH_CHECKS}" != "1" ]]; then
     echo "Missing full Cosmos tokenizer checkpoint: ${COSMOS_TOKENIZER_PATH}" >&2
     exit 2
   }
+  "${PYTHON_BIN}" - "${COSMOS_REASON1_PATH}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from safetensors import safe_open
+
+root = Path(sys.argv[1])
+required = (
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.json",
+    "preprocessor_config.json",
+    "model.safetensors.index.json",
+)
+missing = [name for name in required if not (root / name).is_file()]
+if not missing:
+    try:
+        model_config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+        weight_index = json.loads(
+            (root / "model.safetensors.index.json").read_text(encoding="utf-8")
+        )
+        weight_map = weight_index["weight_map"]
+        expected_total_size = int(weight_index["metadata"]["total_size"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"Invalid Cosmos-Reason1-7B weight index under {root}: {error}"
+        ) from error
+    if not isinstance(model_config, dict):
+        raise SystemExit(f"Invalid Cosmos-Reason1-7B model config under {root}")
+    expected_config = {
+        "model_type": "qwen2_5_vl",
+        "hidden_size": 3584,
+        "num_hidden_layers": 28,
+        "vocab_size": 152064,
+    }
+    mismatches = [
+        f"{key}={model_config.get(key)!r} (expected {expected!r})"
+        for key, expected in expected_config.items()
+        if model_config.get(key) != expected
+    ]
+    if mismatches:
+        raise SystemExit(
+            "Checkpoint does not match Cosmos-Reason1-7B: " + ", ".join(mismatches)
+        )
+    shards = (
+        sorted(set(weight_map.values()))
+        if isinstance(weight_map, dict)
+        and all(isinstance(name, str) for name in weight_map.values())
+        else []
+    )
+    if not shards:
+        missing.append("non-empty model.safetensors.index.json weight_map")
+    missing.extend(
+        name
+        for name in shards
+        if not (root / name).is_file() or (root / name).stat().st_size == 0
+    )
+    if not missing:
+        actual_total_size = sum((root / name).stat().st_size for name in shards)
+        if expected_total_size <= 0 or actual_total_size < expected_total_size:
+            missing.append(
+                "complete weight shards "
+                f"({actual_total_size}/{expected_total_size} bytes)"
+            )
+        expected_keys_by_shard = {
+            shard: {key for key, value in weight_map.items() if value == shard}
+            for shard in shards
+        }
+        for shard_name, expected_keys in expected_keys_by_shard.items():
+            try:
+                with safe_open(root / shard_name, framework="pt", device="cpu") as shard:
+                    actual_keys = set(shard.keys())
+            except Exception as error:
+                raise SystemExit(
+                    f"Invalid Cosmos-Reason1-7B safetensors shard {shard_name}: {error}"
+                ) from error
+            missing_keys = expected_keys - actual_keys
+            if missing_keys:
+                raise SystemExit(
+                    f"Cosmos-Reason1-7B shard {shard_name} is missing indexed keys"
+                )
+if missing:
+    raise SystemExit(
+        f"Incomplete Cosmos-Reason1-7B snapshot under {root}: {', '.join(missing)}"
+    )
+PY
   [[ -f "${CR1_EMBEDDINGS_PATH}" ]] || {
     echo "Missing CR1 embedding cache: ${CR1_EMBEDDINGS_PATH}" >&2
     exit 2
@@ -180,6 +270,8 @@ HYDRA_PATH_OVERRIDES=(
   env.eval.s3_credential_path="${DREAMDOJO_REPO_PATH}/credentials/s3_checkpoint.secret"
   env.train.cosmos_tokenizer_path="${COSMOS_TOKENIZER_PATH}"
   env.eval.cosmos_tokenizer_path="${COSMOS_TOKENIZER_PATH}"
+  env.train.cosmos_reason1_path="${COSMOS_REASON1_PATH}"
+  env.eval.cosmos_reason1_path="${COSMOS_REASON1_PATH}"
   env.train.cr1_embeddings_path="${CR1_EMBEDDINGS_PATH}"
   env.eval.cr1_embeddings_path="${CR1_EMBEDDINGS_PATH}"
   env.train.reward_model.model_path="${REWARD_CKPT_PATH}"
@@ -208,7 +300,8 @@ echo "Piper dataset: ${PIPER_DATASET_PATH}"
 echo "Checkpoint root: ${CHECKPOINT_ROOT}"
 echo "Student DCP: ${STUDENT_CKPT_PATH}"
 echo "Cosmos tokenizer: ${COSMOS_TOKENIZER_PATH}"
-echo "CR1 cache: ${CR1_EMBEDDINGS_PATH}"
+echo "Cosmos-Reason1-7B: ${COSMOS_REASON1_PATH}"
+echo "CR1 compatibility cache: ${CR1_EMBEDDINGS_PATH}"
 echo "VLA checkpoint: ${VLA_CKPT_PATH}"
 echo "Reward checkpoint: ${REWARD_CKPT_PATH}"
 echo "Reset data: ${RESET_DATA_PATH}"

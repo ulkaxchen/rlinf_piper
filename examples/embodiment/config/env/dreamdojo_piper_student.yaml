@@ -43,6 +43,12 @@ config_file: cosmos_predict2/_src/predict2/interactive/configs/config_distill.py
 # Full upstream Wan2.1 VAE tokenizer checkpoint. This explicit path keeps
 # offline server runs independent of the Hugging Face cache layout.
 cosmos_tokenizer_path: /project/peilab/srk/wmpo_workspace/RLinf/checkpoints/cosmos-predict2.5-2B/tokenizer.pth
+# Complete, materialized nvidia/Cosmos-Reason1-7B snapshot. The Student keeps
+# the native online text encoder resident and encodes each reset's episode
+# instruction before warmup.
+cosmos_reason1_path: /project/peilab/chr/rlinf_piper/checkpoints/Cosmos-Reason1-7B
+# ActionStreamingInference still requires this compatibility asset during
+# construction; rollout conditioning is replaced by the online episode text.
 cr1_embeddings_path: /project/peilab/srk/wmpo_workspace/RLinf/checkpoints/cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt
 s3_credential_path: /project/peilab/srk/wmpo_workspace/DreamDojo/credentials/s3_checkpoint.secret
 dreamdojo_context_parallel_size: 1

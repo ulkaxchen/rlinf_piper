@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 
 import numpy as np
@@ -129,6 +130,17 @@ class DreamDojoStudentEnv(DreamDojoEnv):
                 f"DreamDojo student CR1 embedding cache not found: {embedding_path}"
             )
 
+        reason1_path = self.cfg.get("cosmos_reason1_path", None)
+        if reason1_path in (None, "", "null"):
+            raise ValueError(
+                "DreamDojo student online text conditioning requires "
+                "cosmos_reason1_path pointing to a complete local "
+                "Cosmos-Reason1-7B snapshot."
+            )
+        self._validate_complete_reason1_checkpoint(
+            os.path.expanduser(str(reason1_path))
+        )
+
     @staticmethod
     def _validate_complete_dcp_model(model_dir: str) -> None:
         """Check that every shard range referenced by DCP metadata is present."""
@@ -165,9 +177,124 @@ class DreamDojoStudentEnv(DreamDojoEnv):
                 f"shards: {', '.join(incomplete)}"
             )
 
+    @staticmethod
+    def _validate_complete_reason1_checkpoint(checkpoint_dir: str) -> None:
+        """Validate a materialized Cosmos-Reason1-7B HF snapshot."""
+        from safetensors import safe_open
+
+        required_files = (
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.json",
+            "preprocessor_config.json",
+            "model.safetensors.index.json",
+        )
+        missing = [
+            name
+            for name in required_files
+            if not os.path.isfile(os.path.join(checkpoint_dir, name))
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "Cosmos-Reason1-7B snapshot is incomplete under "
+                f"{checkpoint_dir}: missing {', '.join(missing)}."
+            )
+
+        config_path = os.path.join(checkpoint_dir, "config.json")
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                model_config = json.load(config_file)
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Invalid Cosmos-Reason1-7B model config: {config_path}."
+            ) from exc
+        if not isinstance(model_config, dict):
+            raise ValueError(f"Invalid Cosmos-Reason1-7B model config: {config_path}.")
+        expected_config = {
+            "model_type": "qwen2_5_vl",
+            "hidden_size": 3584,
+            "num_hidden_layers": 28,
+            "vocab_size": 152064,
+        }
+        mismatches = [
+            f"{key}={model_config.get(key)!r} (expected {expected!r})"
+            for key, expected in expected_config.items()
+            if model_config.get(key) != expected
+        ]
+        if mismatches:
+            raise ValueError(
+                "Checkpoint does not match the Cosmos-Reason1-7B architecture: "
+                f"{', '.join(mismatches)}."
+            )
+
+        index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+        try:
+            with open(index_path, encoding="utf-8") as index_file:
+                weight_index = json.load(index_file)
+            weight_map = weight_index["weight_map"]
+            expected_total_size = int(weight_index["metadata"]["total_size"])
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Invalid Cosmos-Reason1-7B weight index: {index_path}."
+            ) from exc
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Cosmos-Reason1-7B weight index is empty: {index_path}.")
+        if not all(isinstance(shard_name, str) for shard_name in weight_map.values()):
+            raise ValueError(
+                "Cosmos-Reason1-7B weight index contains invalid shard names: "
+                f"{index_path}."
+            )
+        if expected_total_size <= 0:
+            raise ValueError(f"Cosmos-Reason1-7B total_size is invalid: {index_path}.")
+
+        missing_shards = []
+        shard_names = sorted(set(weight_map.values()))
+        for shard_name in shard_names:
+            shard_path = os.path.join(checkpoint_dir, shard_name)
+            if not os.path.isfile(shard_path) or os.path.getsize(shard_path) == 0:
+                missing_shards.append(shard_name)
+        if missing_shards:
+            raise FileNotFoundError(
+                "Cosmos-Reason1-7B snapshot has missing or empty weight shards: "
+                f"{', '.join(missing_shards)}."
+            )
+
+        actual_total_size = sum(
+            os.path.getsize(os.path.join(checkpoint_dir, shard_name))
+            for shard_name in shard_names
+        )
+        if actual_total_size < expected_total_size:
+            raise FileNotFoundError(
+                "Cosmos-Reason1-7B weight shards are truncated: total file size "
+                f"{actual_total_size} is below index metadata.total_size "
+                f"{expected_total_size}."
+            )
+
+        expected_keys_by_shard: dict[str, set[str]] = {}
+        for weight_name, shard_name in weight_map.items():
+            expected_keys_by_shard.setdefault(shard_name, set()).add(weight_name)
+        for shard_name, expected_keys in expected_keys_by_shard.items():
+            shard_path = os.path.join(checkpoint_dir, shard_name)
+            try:
+                with safe_open(shard_path, framework="pt", device="cpu") as shard:
+                    actual_keys = set(shard.keys())
+            except Exception as exc:
+                raise ValueError(
+                    "Cosmos-Reason1-7B shard is not a valid safetensors file: "
+                    f"{shard_path}."
+                ) from exc
+            missing_keys = sorted(expected_keys - actual_keys)
+            if missing_keys:
+                raise ValueError(
+                    f"Cosmos-Reason1-7B shard {shard_name} is missing indexed "
+                    f"weights: {', '.join(missing_keys[:10])}."
+                )
+
     def _student_checkpoint_experiment_opts(self) -> list[str]:
         """Build Hydra overrides for inference-only student construction."""
         tokenizer_path = os.path.expanduser(str(self.cfg.cosmos_tokenizer_path))
+        reason1_path = os.path.expanduser(str(self.cfg.cosmos_reason1_path))
         experiment_opts = [
             "model.config.net_fake_score=null",
             # ``vae_pth`` is not declared in the registered tokenizer node, so
@@ -175,6 +302,19 @@ class DreamDojoStudentEnv(DreamDojoEnv):
             f"+model.config.tokenizer.vae_pth={tokenizer_path}",
         ]
         experiment_opts.extend(self.cfg.get("student_experiment_opts", []))
+        # Match DreamDojo's native Cosmos-Reason1-7B integration. The tokenizer
+        # keeps its registered Qwen name while ``cache_dir`` makes offline runs
+        # read the same complete local snapshot as the text-encoder weights.
+        experiment_opts.extend(
+            [
+                "model.config.text_encoder_config.compute_online=true",
+                f"model.config.text_encoder_config.ckpt_path={reason1_path}",
+                (
+                    "model.config.text_encoder_config.model_config.tokenizer."
+                    f"cache_dir={reason1_path}"
+                ),
+            ]
+        )
         return experiment_opts
 
     def _build_pipeline(self):
@@ -233,27 +373,116 @@ class DreamDojoStudentEnv(DreamDojoEnv):
             if hasattr(pipe.model, attr):
                 setattr(pipe.model, attr, None)
 
-        # The 8-GPU preset keeps the cached CR1 embedding on each rank's GPU.
-        # ActionStreamingInference names this attribute ``*_cpu`` but only ever
-        # calls ``.to(model_device)`` on it, so replacing it with the resident
-        # tensor also removes a roughly 98 MiB H2D copy from every chunk.
-        model_device = pipe.model.tensor_kwargs["device"]
-        model_dtype = pipe.model.tensor_kwargs["dtype"]
-        self._student_text_embeddings_gpu = pipe.t5_text_embeddings_cpu.to(
-            device=model_device, dtype=model_dtype
-        )
-        pipe.t5_text_embeddings_cpu = self._student_text_embeddings_gpu
-        self._student_text_mask_gpu = torch.ones(
-            (
-                self._student_text_embeddings_gpu.shape[0],
-                self._student_text_embeddings_gpu.shape[1],
-            ),
-            device=model_device,
-            dtype=model_dtype,
-        )
+        if pipe.model.text_encoder is None:
+            raise RuntimeError(
+                "DreamDojo did not construct the online Cosmos-Reason1-7B text "
+                "encoder. Check the student experiment overrides."
+            )
+
+        # The compatibility empty-string tensor remains on CPU because the
+        # upstream streaming constructor requires it. Every reset replaces it
+        # with freshly encoded per-episode instructions for actual generation.
+        self._student_text_embeddings_gpu: torch.Tensor | None = None
+        self._student_text_mask_gpu: torch.Tensor | None = None
+        self._student_text_prompts: tuple[str, ...] = ()
         gc.collect()
         self._clear_accelerator_cache()
         return pipe
+
+    @torch.no_grad()
+    def _encode_student_episode_instructions(self) -> None:
+        """Encode this reset's instructions with the native Reason1 encoder."""
+        prompts = tuple(str(prompt) for prompt in self.task_descriptions)
+        if len(prompts) != self.num_envs:
+            raise RuntimeError(
+                "DreamDojo student expected one instruction per environment, "
+                f"got {len(prompts)} for {self.num_envs} environments."
+            )
+        empty_indices = [
+            idx for idx, prompt in enumerate(prompts) if not prompt.strip()
+        ]
+        if empty_indices:
+            raise ValueError(
+                "DreamDojo student reset episodes are missing instructions for "
+                f"environment indices {empty_indices}."
+            )
+
+        model = self.pipe.model
+        text_encoder = model.text_encoder
+        if text_encoder is None:
+            raise RuntimeError("Cosmos-Reason1-7B text encoder is not initialized.")
+        caption_key = str(getattr(model, "input_caption_key", "ai_caption"))
+        embeddings = text_encoder.compute_text_embeddings_online(
+            data_batch={caption_key: list(prompts), "images": None},
+            input_caption_key=caption_key,
+        )
+        if not isinstance(embeddings, torch.Tensor) or embeddings.ndim != 3:
+            shape = getattr(embeddings, "shape", None)
+            raise RuntimeError(
+                "Cosmos-Reason1-7B returned invalid text embeddings; expected "
+                f"[B, T, D], got {shape}."
+            )
+        if embeddings.shape[0] != self.num_envs:
+            raise RuntimeError(
+                "Cosmos-Reason1-7B returned the wrong embedding batch size: "
+                f"got {embeddings.shape[0]}, expected {self.num_envs}."
+            )
+
+        compatibility_embedding = self.pipe.t5_text_embeddings_cpu
+        if compatibility_embedding.ndim == 2:
+            compatibility_embedding = compatibility_embedding.unsqueeze(0)
+        expected_shape = tuple(compatibility_embedding.shape[1:])
+        if tuple(embeddings.shape[1:]) != expected_shape:
+            raise RuntimeError(
+                "Cosmos-Reason1-7B embedding shape does not match the Student "
+                f"conditioner: got {tuple(embeddings.shape[1:])}, expected "
+                f"{expected_shape}."
+            )
+
+        model_device = model.tensor_kwargs["device"]
+        model_dtype = model.tensor_kwargs["dtype"]
+        self._student_text_embeddings_gpu = (
+            embeddings.detach().to(device=model_device, dtype=model_dtype).contiguous()
+        )
+        self._student_text_mask_gpu = torch.ones(
+            self._student_text_embeddings_gpu.shape[:2],
+            device=model_device,
+            dtype=model_dtype,
+        )
+        self._student_text_prompts = prompts
+
+    def _student_text_condition(
+        self, env_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the online Reason1 condition bound to one environment."""
+        if not 0 <= env_idx < self.num_envs:
+            raise IndexError(
+                f"DreamDojo student environment index out of range: {env_idx}."
+            )
+        current_prompts = tuple(str(prompt) for prompt in self.task_descriptions)
+        if self._student_text_prompts != current_prompts:
+            raise RuntimeError(
+                "DreamDojo student text embeddings are stale for the active "
+                "episode instructions. Reset must encode text before generation."
+            )
+        if (
+            self._student_text_embeddings_gpu is None
+            or self._student_text_mask_gpu is None
+        ):
+            raise RuntimeError(
+                "DreamDojo student text embeddings have not been computed for "
+                "the active reset."
+            )
+        return (
+            self._student_text_embeddings_gpu[env_idx : env_idx + 1],
+            self._student_text_mask_gpu[env_idx : env_idx + 1],
+        )
+
+    def _inject_student_text_condition(self, data_batch: dict, env_idx: int) -> None:
+        """Attach one environment's online Reason1 condition to a model batch."""
+        embeddings, mask = self._student_text_condition(env_idx)
+        data_batch["t5_text_embeddings"] = embeddings
+        data_batch["t5_text_mask"] = mask
 
     def _validate_student_temporal_contract(self) -> None:
         """Check the environment cadence against the loaded student network."""
@@ -304,6 +533,7 @@ class DreamDojoStudentEnv(DreamDojoEnv):
     def reset(self, *args, **kwargs):
         """Reset and build the student's native causal warmup prefix."""
         obs, info = super().reset(*args, **kwargs)
+        self._encode_student_episode_instructions()
         self.student_bootstrap_complete = False
         if self.student_bootstrap_enabled:
             self._bootstrap_student_context()
@@ -369,20 +599,27 @@ class DreamDojoStudentEnv(DreamDojoEnv):
     @torch.no_grad()
     def _generate_student_bootstrap_video(
         self,
+        env_idx: int,
         initial_frame: torch.Tensor,
         model_actions: torch.Tensor,
         seed: int,
     ) -> torch.Tensor:
         """Generate one conditioning frame plus twelve student warmup frames."""
-        video = self.pipe.generate_action_streaming(
-            video_path=initial_frame.permute(1, 2, 0).unsqueeze(0).cpu().numpy(),
-            actions_np=model_actions.cpu().numpy(),
-            resolution_hw=(self.gen_height, self.gen_width),
-            num_steps=self.num_inference_steps,
-            seed=seed,
-            start_frame_idx=0,
-            max_frames=self.student_bootstrap_model_actions + 1,
-        )
+        embeddings, _ = self._student_text_condition(env_idx)
+        compatibility_embedding = self.pipe.t5_text_embeddings_cpu
+        self.pipe.t5_text_embeddings_cpu = embeddings
+        try:
+            video = self.pipe.generate_action_streaming(
+                video_path=initial_frame.permute(1, 2, 0).unsqueeze(0).cpu().numpy(),
+                actions_np=model_actions.cpu().numpy(),
+                resolution_hw=(self.gen_height, self.gen_width),
+                num_steps=self.num_inference_steps,
+                seed=seed,
+                start_frame_idx=0,
+                max_frames=self.student_bootstrap_model_actions + 1,
+            )
+        finally:
+            self.pipe.t5_text_embeddings_cpu = compatibility_embedding
         if video.ndim != 5 or video.shape[:2] != (1, 3):
             raise RuntimeError(
                 "DreamDojo student warmup returned invalid video shape "
@@ -419,6 +656,7 @@ class DreamDojoStudentEnv(DreamDojoEnv):
             )
             initial = self.current_obs[env_idx].detach().cpu().permute(2, 0, 1)
             video = self._generate_student_bootstrap_video(
+                env_idx,
                 initial,
                 cosmos_actions,
                 self.seed_base + env_idx,
@@ -471,8 +709,7 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         model._normalize_video_databatch_inplace(data_batch)
         model._augment_image_dim_inplace(data_batch)
 
-        data_batch["t5_text_embeddings"] = self._student_text_embeddings_gpu
-        data_batch["t5_text_mask"] = self._student_text_mask_gpu
+        self._inject_student_text_condition(data_batch, env_idx)
         for key, value in list(data_batch.items()):
             if isinstance(value, torch.Tensor) and torch.is_floating_point(value):
                 data_batch[key] = value.to(dtype=model.tensor_kwargs["dtype"])
