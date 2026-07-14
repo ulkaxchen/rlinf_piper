@@ -124,6 +124,16 @@ def get_env_cls(env_type: str, env_cfg=None):
 
         return WanEnv
     elif env_type == SupportedEnvType.DREAMDOJOWM:
+        if (
+            env_cfg is not None
+            and str(env_cfg.get("dreamdojo_backend", "autoreg")).lower()
+            == "distilled_student"
+        ):
+            from rlinf.envs.world_model.world_model_dreamdojo_student_env import (
+                DreamDojoStudentEnv,
+            )
+
+            return DreamDojoStudentEnv
         from rlinf.envs.world_model.world_model_dreamdojo_env import DreamDojoEnv
 
         return DreamDojoEnv

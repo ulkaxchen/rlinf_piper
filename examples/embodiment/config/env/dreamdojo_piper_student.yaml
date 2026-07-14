@@ -1,0 +1,94 @@
+env_type: dreamdojo_wm
+task_suite_name: piper_insert_mouse_battery
+wm_env_type: piper
+
+total_num_envs: null
+
+auto_reset: False
+ignore_terminations: False
+# Preserve the teacher preset's 20 policy chunks per trajectory:
+# 20 chunks * 12 actions/chunk = 240 raw 30 Hz actions.
+max_steps_per_rollout_epoch: 240
+max_episode_steps: 240
+
+use_rel_reward: False
+reward_coef: 1.0
+
+is_eval: False
+
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: True
+use_ordered_reset_state_ids: False
+specific_reset_id: null
+
+video_cfg:
+  save_video: True
+  info_on_video: True
+  fps: 10
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+# The 8-GPU preset keeps the student and reward model resident on each GPU.
+enable_offload: False
+
+### DreamDojo causal distilled-student parameters
+
+dreamdojo_repo_path: /project/peilab/srk/wmpo_workspace/DreamDojo
+dreamdojo_backend: distilled_student
+# DCP root; the loader reads the model/ child and its .metadata file.
+dreamdojo_ckpt_path: /project/peilab/srk/wmpo_workspace/RLinf/checkpoints/dreamdojo_distill_3000
+experiment: cosmos_predict2p5_2B_action_gr00t_pretrain_self_forcing_no_s3
+config_file: cosmos_predict2/_src/predict2/interactive/configs/config_distill.py
+cr1_embeddings_path: /project/peilab/srk/wmpo_workspace/RLinf/checkpoints/cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt
+s3_credential_path: /project/peilab/srk/wmpo_workspace/DreamDojo/credentials/s3_checkpoint.secret
+dreamdojo_context_parallel_size: 1
+dreamdojo_enable_fsdp: False
+dreamdojo_torch_compile: False
+student_experiment_opts: []
+
+enable_kir: False
+
+# Each reset trajectory must contain at least 36 frames/actions and an
+# ``abs_action`` key. The first 36 actions warm the student context only and do
+# not enter reward calculation or the GRPO trajectory.
+initial_image_path: /project/peilab/srk/wmpo_workspace/piper_data/insert-mouse-battery/piper_initial_frames_36
+
+# One RL step: 12 policy actions at 30 Hz -> 4 student actions/RGB frames.
+chunk: 12
+action_stride: 3
+num_inference_steps: 4
+student_actions_per_latent: 4
+student_cache_latents: 3
+student_condition_fps: 4.0
+student_bootstrap_enabled: True
+student_bootstrap_action_key: abs_action
+student_bootstrap_policy_actions: 36
+
+guidance: 0
+height: 1440
+width: 640
+num_latent_conditional_frames: 0
+image_size: [480, 640]
+num_camera_views: 3
+
+# Action layout and normalization are identical to the teacher environment.
+model_action_dim: 384
+action_slot: [169, 183]
+policy_action_format: absolute
+action_delta_window: 4
+action_norm_mode: min_max
+action_norm_key: action
+action_norm_stats_path: /project/peilab/srk/wmpo_workspace/piper_data/insert-mouse-battery/piper_insert_mouse_battery_lerobot/meta/stats.json
+
+# Keep the existing Cosmos/RLinf ResNet reward path unchanged.
+reward_model:
+  type: resnet
+  model_path: /project/peilab/srk/wmpo_workspace/piper_data/insert-mouse-battery/reward_model/full_weights.pt
+  arch: resnet18
+  pretrained: False
+  hidden_dim: null
+  dropout: 0
+  image_size: [3, 1440, 640]
+  normalize: true
+  precision: fp32
+  reward_threshold: null

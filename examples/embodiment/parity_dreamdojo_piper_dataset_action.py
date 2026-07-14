@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 """Parity check DreamDojo piper actions through the RLinf env wrapper.
 
-This bypasses OpenPI entirely. It loads DreamDojo's dataset action sequence,
-takes the piper slice [169:183], configures DreamDojoEnv as a 12-frame delta
-action world model, and runs chunk_step through the RLinf input path.
+This teacher-only utility bypasses OpenPI entirely. It loads DreamDojo's dataset
+action sequence, takes the Piper slice [169:183], configures the autoregressive
+teacher as a 12-frame delta-action world model, and runs ``chunk_step`` through
+the RLinf input path. Student causal-state checks live in
+``tests/unit_tests/test_dreamdojo_student_env.py``.
 """
 
 import argparse
@@ -13,13 +15,12 @@ from pathlib import Path
 import imageio.v2 as imageio
 import numpy as np
 import torch
+from dreamdojo_venv_compat import ensure_scheduler_worker
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 
-from dreamdojo_venv_compat import ensure_scheduler_worker
-
 Worker = ensure_scheduler_worker()
-from rlinf.envs.world_model.world_model_dreamdojo_env import DreamDojoEnv
+from rlinf.envs.world_model.world_model_dreamdojo_env import DreamDojoEnv  # noqa: E402
 
 
 def _parse_args():
@@ -28,7 +29,7 @@ def _parse_args():
         "--config-dir",
         default="/project/peilab/srk/wmpo_workspace/RLinf/examples/embodiment/config",
     )
-    parser.add_argument("--config-name", default="dreamdojo_piper_grpo")
+    parser.add_argument("--config-name", default="env/dreamdojo_piper")
     parser.add_argument(
         "--dataset-path",
         default="/project/peilab/srk/wmpo_workspace/piper_data/insert-mouse-battery/piper_insert_mouse_battery_lerobot",
@@ -50,26 +51,34 @@ def _compose_env_cfg(args):
     if GlobalHydra.instance().is_initialized():
         GlobalHydra.instance().clear()
 
+    prefix = "env." if args.config_name.startswith("env/") else "env.train."
     overrides = [
-        "env.train.total_num_envs=1",
-        "env.train.group_size=1",
-        f"env.train.chunk={args.chunk_size}",
-        "env.train.action_stride=1",
-        "env.train.policy_action_format=delta",
-        "env.train.action_norm_mode=none",
-        f"env.train.num_inference_steps={args.num_inference_steps}",
-        f"env.train.max_episode_steps={args.num_chunks * args.chunk_size}",
-        f"env.train.max_steps_per_rollout_epoch={args.num_chunks * args.chunk_size}",
-        "env.train.auto_reset=False",
-        "env.train.ignore_terminations=True",
-        "env.train.use_fixed_reset_state_ids=False",
-        "env.train.enable_offload=False",
-        "env.train.video_cfg.save_video=False",
-        "env.train.reward_model.type=null",
+        f"{prefix}total_num_envs=1",
+        f"{prefix}group_size=1",
+        f"{prefix}chunk={args.chunk_size}",
+        f"{prefix}action_stride=1",
+        f"{prefix}policy_action_format=delta",
+        f"{prefix}action_norm_mode=none",
+        f"{prefix}num_inference_steps={args.num_inference_steps}",
+        f"{prefix}max_episode_steps={args.num_chunks * args.chunk_size}",
+        f"{prefix}max_steps_per_rollout_epoch={args.num_chunks * args.chunk_size}",
+        f"{prefix}auto_reset=False",
+        f"{prefix}ignore_terminations=True",
+        f"{prefix}use_fixed_reset_state_ids=False",
+        f"{prefix}enable_offload=False",
+        f"{prefix}video_cfg.save_video=False",
+        f"{prefix}reward_model.type=null",
     ]
-    with initialize_config_dir(version_base="1.1", config_dir=args.config_dir):
+    config_dir = str(Path(args.config_dir).resolve())
+    with initialize_config_dir(version_base="1.1", config_dir=config_dir):
         cfg = compose(config_name=args.config_name, overrides=overrides)
-    return cfg.env.train
+    env_cfg = cfg.env if args.config_name.startswith("env/") else cfg.env.train
+    if env_cfg.get("dreamdojo_backend", "autoreg") != "autoreg":
+        raise ValueError(
+            "This dataset-action parity utility is teacher-only. Use "
+            "--config-name env/dreamdojo_piper."
+        )
+    return env_cfg
 
 
 def _write_video(path: Path, frames: np.ndarray, fps: int):
@@ -149,7 +158,9 @@ def main():
     _write_video(out_dir / "pred.mp4", pred_video, args.fps)
     _write_video(out_dir / "gt.mp4", gt_video, args.fps)
     _write_video(out_dir / "merged_gt_left_pred_right.mp4", merged_video, args.fps)
-    np.savez_compressed(out_dir / "frames.npz", pred=pred_video, gt=gt_video, merged=merged_video)
+    np.savez_compressed(
+        out_dir / "frames.npz", pred=pred_video, gt=gt_video, merged=merged_video
+    )
 
     summary = {
         "index": args.index,

@@ -326,6 +326,9 @@ class DreamDojoEnv(BaseWorldEnv):
             )
         elif isinstance(episode_indices, torch.Tensor):
             episode_indices = episode_indices.cpu().numpy()
+        self._last_reset_episode_indices = np.asarray(
+            episode_indices, dtype=np.int64
+        ).copy()
 
         frames = []  # list of uint8 [H, W, 3]
         task_descriptions = []
@@ -894,7 +897,10 @@ if __name__ == "__main__":
         cfg_ = compose(config_name=config_name)
         cfg = cfg_["env"]["train"]
 
-    env = DreamDojoEnv(cfg, cfg.total_num_envs, seed_offset=0, total_num_processes=1)
+    from rlinf.envs import get_env_cls
+
+    env_cls = get_env_cls(cfg.env_type, cfg)
+    env = env_cls(cfg, cfg.total_num_envs, seed_offset=0, total_num_processes=1)
     obs, info = env.reset()
     print("After reset, obs keys:", list(obs.keys()))
     print("main_images:", obs["main_images"].shape, obs["main_images"].dtype)

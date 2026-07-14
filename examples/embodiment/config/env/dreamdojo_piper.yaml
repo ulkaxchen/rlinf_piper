@@ -35,8 +35,9 @@ enable_offload: False
 # Path to the DreamDojo repo (added to sys.path so `cosmos_predict2` imports).
 dreamdojo_repo_path: /project/peilab/srk/wmpo_workspace/DreamDojo
 
-# Cosmos checkpoint + experiment registration. Match the DreamDojo reference
-# piper autoreg command, which uses the converted EMA bf16 checkpoint.
+# Teacher backend. Match the DreamDojo reference Piper autoregressive command,
+# which uses the converted EMA BF16 checkpoint.
+dreamdojo_backend: autoreg
 dreamdojo_ckpt_path: /project/peilab/srk/wmpo_workspace/DreamDojo/dreamdojo_logs/dreamdojo/exp1201/piper_vertical_1440_640_fps10/checkpoints/iter_000030000/model_ema_bf16.pt
 experiment: dreamdojo_2b_1440_640_piper
 config_file: cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py

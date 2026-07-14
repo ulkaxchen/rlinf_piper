@@ -1,24 +1,20 @@
 defaults:
-  - env/dreamdojo_piper@env.train
-  - env/dreamdojo_piper@env.eval
+  - env/dreamdojo_piper_student@env.train
+  - env/dreamdojo_piper_student@env.eval
   - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
 
-# NOTE: This config wires the DreamDojo piper world model into RLinf's embodied
-# GRPO loop, with pi0.5 as the policy. For *rollout* the algorithm choice does
-# not matter (PPO vs GRPO only differs in the gradient step). Reward is a zero
-# stub until the piper reward model lands, so any real training is meaningless
-# regardless of algorithm.
+# NOTE: This config wires the causal DreamDojo piper student into RLinf's
+# embodied GRPO loop, with pi0.5 as the policy. The student is frozen; GRPO only
+# updates pi0.5. On 8 GPUs actor, rollout, student, and reward stay GPU-resident.
 #
 # Notes:
-# - Policy: the openpi dataconfig "pi05_piper" (rlinf/models/embodiment/openpi/
-#   dataconfig/) matches piper's obs/action spec. It emits *absolute* 14-dim
-#   joint actions (use_delta_joint_actions=False) padded to the model's internal
-#   action_dim=32; the env min-max normalizes and diffs them into DreamDojo's
-#   training space (see env.action_norm_* keys). The SFT'd pi0.5 (run2/iter30000)
-#   used action_horizon=50; norm_stats live in assets/norm_stats.json.
+# - pi0.5 emits 12 absolute 14-dim actions per chunk. The env stride-samples
+#   four actions, applies the existing normalization/delta transform, and asks
+#   the student for one latent/four RGB frames. Reset separately warms the
+#   student with 36 demonstration actions and retains a 9-frame/8-action cache.
 # - If switching to PPO actor-critic later: set add_value_head=True and flip
 #   algorithm.loss_type=actor_critic + algorithm.adv_type=gae.
 
@@ -93,23 +89,24 @@ env:
     rollout_epoch: 1
     total_num_envs: 16
     group_size: ${algorithm.group_size}
-    max_episode_steps: 720
-    max_steps_per_rollout_epoch: 720
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
     reward_coef: ${algorithm.reward_coef}
-    enable_offload: True       # otherwise, may OOM at 1440x640
+    enable_offload: False
     success_reward_threshold: 0.9
-    num_inference_steps: 35     
+    num_inference_steps: 4
   eval:
     rollout_epoch: 1
     total_num_envs: 8
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 720
-    max_steps_per_rollout_epoch: 720
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
     group_size: 1
     is_eval: True
     success_reward_threshold: 0.9
-    num_inference_steps: 5
+    num_inference_steps: 4
+    enable_offload: False
     video_cfg:
       save_video: True
       fps: 10
@@ -127,7 +124,7 @@ rollout:
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
   recompute_logprobs: False
-  enable_offload: True
+  enable_offload: False
   pipeline_stage_num: 1
 
   model:
@@ -141,12 +138,12 @@ actor:
   micro_batch_size: 20
   global_batch_size: 160
   seed: 1234
-  enable_offload: True
+  enable_offload: False
 
   model:
     model_path: "/project/peilab/srk/wmpo_workspace/kai0/checkpoints/pi05_piper_insert_mouse_battery_normal/piper_insert_mouse_battery_run2/30000_pytorch"
     model_type: "openpi"
-    num_action_chunks: 36
+    num_action_chunks: 12
     action_dim: 14
     add_value_head: False   # GRPO does not use a critic head
     openpi:
