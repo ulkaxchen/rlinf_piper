@@ -31,6 +31,10 @@ def _make_env_without_models(num_envs: int = 1) -> DreamDojoStudentEnv:
     env.student_actions_per_latent = 4
     env.student_cache_latents = 3
     env.student_condition_fps = 4.0
+    env.student_decode_dit_offload = False
+    env.student_release_text_encoder_after_reset = False
+    env.student_sequential_text_encoder = False
+    env.student_capture_bootstrap_frames = False
     env.student_context_pixel_frames = 9
     env.student_history_actions = 8
     env.student_bootstrap_enabled = True
@@ -54,6 +58,7 @@ def _make_env_without_models(num_envs: int = 1) -> DreamDojoStudentEnv:
     env._student_text_embeddings_gpu = None
     env._student_text_mask_gpu = None
     env._student_text_prompts = ()
+    env.last_bootstrap_frames = None
     env._clear_accelerator_cache = lambda: None
     return env
 
@@ -145,6 +150,81 @@ def test_student_rejects_wrong_online_reason1_batch_size():
 
     with pytest.raises(RuntimeError, match="wrong embedding batch size"):
         env._encode_student_episode_instructions()
+
+
+def test_student_sequential_reason1_moves_pipeline_around_temporary_encoder(
+    monkeypatch,
+):
+    env = _make_env_without_models()
+    env.student_sequential_text_encoder = True
+    events = []
+
+    class _TemporaryTextEncoder:
+        def __init__(self, config, device):
+            events.append(("encoder_init", config, device))
+
+        def compute_text_embeddings_online(self, data_batch, input_caption_key):
+            events.append(("encode", data_batch, input_caption_key))
+            return torch.ones(1, 3, 4)
+
+    text_encoder_module = ModuleType("text_encoder")
+    text_encoder_module.TextEncoder = _TemporaryTextEncoder
+    monkeypatch.setitem(
+        sys.modules,
+        "cosmos_predict2._src.predict2.text_encoders.text_encoder",
+        text_encoder_module,
+    )
+
+    text_encoder_config = SimpleNamespace(compute_online=False)
+    env.pipe = SimpleNamespace(
+        model=SimpleNamespace(
+            text_encoder=None,
+            config=SimpleNamespace(text_encoder_config=text_encoder_config),
+            input_caption_key="ai_caption",
+            tensor_kwargs={"device": torch.device("cpu"), "dtype": torch.bfloat16},
+        ),
+        t5_text_embeddings_cpu=torch.zeros(1, 3, 4),
+    )
+    env._move_pipe = lambda device: events.append(("move_student", str(device)))
+
+    env._encode_student_episode_instructions()
+
+    assert events == [
+        ("move_student", "cpu"),
+        ("encoder_init", text_encoder_config, "cpu"),
+        (
+            "encode",
+            {"ai_caption": ["task 0"], "images": None},
+            "ai_caption",
+        ),
+        ("move_student", "cpu"),
+    ]
+    assert env.pipe.model.text_encoder is None
+    assert env._student_text_embeddings_gpu.shape == (1, 3, 4)
+    assert env._student_text_embeddings_gpu.dtype == torch.bfloat16
+
+
+def test_student_pipe_move_includes_plain_reason1_wrapper():
+    env = _make_env_without_models()
+    events = []
+
+    class _Movable:
+        def __init__(self, name):
+            self.name = name
+
+        def to(self, device):
+            events.append((self.name, str(device)))
+            return self
+
+    text_encoder = SimpleNamespace(model=_Movable("reason1"), device="cuda")
+    model = _Movable("student")
+    model.text_encoder = text_encoder
+    env.pipe = SimpleNamespace(model=model)
+
+    env._move_pipe("cpu")
+
+    assert events == [("student", "cpu"), ("reason1", "cpu")]
+    assert env.pipe.model.text_encoder.device == "cpu"
 
 
 def test_student_bootstrap_uses_matching_online_reason1_embedding():
@@ -340,6 +420,7 @@ def test_student_chunk_generates_four_frames_and_preserves_causal_history():
 
 def test_student_bootstrap_uses_36_demo_actions_without_exposing_reward():
     env = _make_env_without_models()
+    env.student_capture_bootstrap_frames = True
     trajectory = np.array(
         [
             {"abs_action": np.full(14, action_idx, dtype=np.float32)}
@@ -376,6 +457,8 @@ def test_student_bootstrap_uses_36_demo_actions_without_exposing_reward():
         torch.arange(12, 36, 3, dtype=torch.float32).view(8, 1).expand(-1, 14),
     )
     assert torch.equal(env.current_states, torch.full((1, 14), 35.0))
+    assert env.last_bootstrap_frames.shape == (1, 12, 3, 2, 2)
+    assert env.last_bootstrap_frames.device.type == "cpu"
     assert env.last_chunk_frames is None
 
 
@@ -505,7 +588,6 @@ def test_student_checkpoint_opts_add_explicit_full_tokenizer(tmp_path):
             "student_experiment_opts": ["model.config.fsdp_shard_size=1"],
         }
     )
-
     assert env._student_checkpoint_experiment_opts() == [
         "model.config.net_fake_score=null",
         f"+model.config.tokenizer.vae_pth={tokenizer}",
@@ -629,6 +711,10 @@ def test_default_grpo_config_is_8gpu_resident_student(monkeypatch):
     assert cfg.env.eval.enable_offload is False
     assert cfg.rollout.enable_offload is False
     assert cfg.actor.enable_offload is False
+    assert cfg.env.train.student_decode_dit_offload is False
+    assert cfg.env.train.student_release_text_encoder_after_reset is False
+    assert cfg.env.train.student_sequential_text_encoder is False
+    assert cfg.env.train.student_capture_bootstrap_frames is False
     assert cfg.env.train.initial_image_path.endswith("piper_initial_frames_36")
     assert cfg.env.train.cr1_embeddings_path.endswith(
         "cosmos-predict2.5-2B/robot/action-cond/cr1_empty_string_text_embeddings.pt"

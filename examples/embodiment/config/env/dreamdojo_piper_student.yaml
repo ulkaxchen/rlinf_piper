@@ -70,6 +70,18 @@ num_inference_steps: 4
 student_actions_per_latent: 4
 student_cache_latents: 3
 student_condition_fps: 4.0
+# Keep the DiT and VAE resident together on H800. The standalone RTX 5090
+# rollout launcher overrides this to true to reduce the VAE decode peak.
+student_decode_dit_offload: False
+# H800 keeps Cosmos-Reason1 resident for later episode resets. The one-episode
+# RTX 5090 rollout smoke overrides this after dynamically encoding its prompt.
+student_release_text_encoder_after_reset: False
+# RTX 5090 only: construct Reason1 while the student pipeline is on CPU instead
+# of ever co-residing the 7B encoder with the DiT/VAE. H800 keeps this false.
+student_sequential_text_encoder: False
+# Debug-only capture for rollout videos; disabled in GRPO to avoid retaining a
+# full 12-frame warmup tensor for every environment.
+student_capture_bootstrap_frames: False
 student_bootstrap_enabled: True
 student_bootstrap_action_key: abs_action
 student_bootstrap_policy_actions: 36

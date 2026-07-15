@@ -46,6 +46,18 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         )
         self.student_cache_latents = int(self.cfg.get("student_cache_latents", 3))
         self.student_condition_fps = float(self.cfg.get("student_condition_fps", 4.0))
+        self.student_decode_dit_offload = bool(
+            self.cfg.get("student_decode_dit_offload", False)
+        )
+        self.student_release_text_encoder_after_reset = bool(
+            self.cfg.get("student_release_text_encoder_after_reset", False)
+        )
+        self.student_sequential_text_encoder = bool(
+            self.cfg.get("student_sequential_text_encoder", False)
+        )
+        self.student_capture_bootstrap_frames = bool(
+            self.cfg.get("student_capture_bootstrap_frames", False)
+        )
         self.student_context_pixel_frames = (
             self.student_cache_latents - 1
         ) * self.student_actions_per_latent + 1
@@ -74,6 +86,7 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         self._validate_student_temporal_contract()
         self._student_condition_frames: torch.Tensor | None = None
         self._student_action_history: torch.Tensor | None = None
+        self.last_bootstrap_frames: torch.Tensor | None = None
 
     def _validate_distilled_student_inputs(self) -> None:
         """Validate the full student DCP and its external Cosmos assets."""
@@ -295,6 +308,9 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         """Build Hydra overrides for inference-only student construction."""
         tokenizer_path = os.path.expanduser(str(self.cfg.cosmos_tokenizer_path))
         reason1_path = os.path.expanduser(str(self.cfg.cosmos_reason1_path))
+        sequential_text_encoder = bool(
+            self.cfg.get("student_sequential_text_encoder", False)
+        )
         experiment_opts = [
             "model.config.net_fake_score=null",
             # ``vae_pth`` is not declared in the registered tokenizer node, so
@@ -307,7 +323,10 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         # read the same complete local snapshot as the text-encoder weights.
         experiment_opts.extend(
             [
-                "model.config.text_encoder_config.compute_online=true",
+                (
+                    "model.config.text_encoder_config.compute_online="
+                    f"{'false' if sequential_text_encoder else 'true'}"
+                ),
                 f"model.config.text_encoder_config.ckpt_path={reason1_path}",
                 (
                     "model.config.text_encoder_config.model_config.tokenizer."
@@ -373,7 +392,9 @@ class DreamDojoStudentEnv(DreamDojoEnv):
             if hasattr(pipe.model, attr):
                 setattr(pipe.model, attr, None)
 
-        if pipe.model.text_encoder is None:
+        if pipe.model.text_encoder is None and not bool(
+            self.cfg.get("student_sequential_text_encoder", False)
+        ):
             raise RuntimeError(
                 "DreamDojo did not construct the online Cosmos-Reason1-7B text "
                 "encoder. Check the student experiment overrides."
@@ -409,47 +430,78 @@ class DreamDojoStudentEnv(DreamDojoEnv):
 
         model = self.pipe.model
         text_encoder = model.text_encoder
+        restore_student_pipeline = False
         if text_encoder is None:
-            raise RuntimeError("Cosmos-Reason1-7B text encoder is not initialized.")
-        caption_key = str(getattr(model, "input_caption_key", "ai_caption"))
-        embeddings = text_encoder.compute_text_embeddings_online(
-            data_batch={caption_key: list(prompts), "images": None},
-            input_caption_key=caption_key,
-        )
-        if not isinstance(embeddings, torch.Tensor) or embeddings.ndim != 3:
-            shape = getattr(embeddings, "shape", None)
-            raise RuntimeError(
-                "Cosmos-Reason1-7B returned invalid text embeddings; expected "
-                f"[B, T, D], got {shape}."
-            )
-        if embeddings.shape[0] != self.num_envs:
-            raise RuntimeError(
-                "Cosmos-Reason1-7B returned the wrong embedding batch size: "
-                f"got {embeddings.shape[0]}, expected {self.num_envs}."
-            )
+            if not self.student_sequential_text_encoder:
+                raise RuntimeError("Cosmos-Reason1-7B text encoder is not initialized.")
 
-        compatibility_embedding = self.pipe.t5_text_embeddings_cpu
-        if compatibility_embedding.ndim == 2:
-            compatibility_embedding = compatibility_embedding.unsqueeze(0)
-        expected_shape = tuple(compatibility_embedding.shape[1:])
-        if tuple(embeddings.shape[1:]) != expected_shape:
-            raise RuntimeError(
-                "Cosmos-Reason1-7B embedding shape does not match the Student "
-                f"conditioner: got {tuple(embeddings.shape[1:])}, expected "
-                f"{expected_shape}."
-            )
+            # A 32 GiB RTX 5090 cannot safely overlap Reason1 inference with the
+            # student DiT and full-resolution VAE. Keep the already-loaded
+            # student on CPU while constructing the native encoder just for this
+            # episode, then restore the student before its causal warmup.
+            self._move_pipe("cpu")
+            gc.collect()
+            self._clear_accelerator_cache()
+            restore_student_pipeline = True
 
-        model_device = model.tensor_kwargs["device"]
-        model_dtype = model.tensor_kwargs["dtype"]
-        self._student_text_embeddings_gpu = (
-            embeddings.detach().to(device=model_device, dtype=model_dtype).contiguous()
-        )
-        self._student_text_mask_gpu = torch.ones(
-            self._student_text_embeddings_gpu.shape[:2],
-            device=model_device,
-            dtype=model_dtype,
-        )
-        self._student_text_prompts = prompts
+        try:
+            if text_encoder is None:
+                from cosmos_predict2._src.predict2.text_encoders.text_encoder import (
+                    TextEncoder,
+                )
+
+                text_encoder = TextEncoder(
+                    model.config.text_encoder_config,
+                    device=str(self.device),
+                )
+            caption_key = str(getattr(model, "input_caption_key", "ai_caption"))
+            embeddings = text_encoder.compute_text_embeddings_online(
+                data_batch={caption_key: list(prompts), "images": None},
+                input_caption_key=caption_key,
+            )
+            if not isinstance(embeddings, torch.Tensor) or embeddings.ndim != 3:
+                shape = getattr(embeddings, "shape", None)
+                raise RuntimeError(
+                    "Cosmos-Reason1-7B returned invalid text embeddings; expected "
+                    f"[B, T, D], got {shape}."
+                )
+            if embeddings.shape[0] != self.num_envs:
+                raise RuntimeError(
+                    "Cosmos-Reason1-7B returned the wrong embedding batch size: "
+                    f"got {embeddings.shape[0]}, expected {self.num_envs}."
+                )
+
+            compatibility_embedding = self.pipe.t5_text_embeddings_cpu
+            if compatibility_embedding.ndim == 2:
+                compatibility_embedding = compatibility_embedding.unsqueeze(0)
+            expected_shape = tuple(compatibility_embedding.shape[1:])
+            if tuple(embeddings.shape[1:]) != expected_shape:
+                raise RuntimeError(
+                    "Cosmos-Reason1-7B embedding shape does not match the Student "
+                    f"conditioner: got {tuple(embeddings.shape[1:])}, expected "
+                    f"{expected_shape}."
+                )
+
+            model_device = model.tensor_kwargs["device"]
+            model_dtype = model.tensor_kwargs["dtype"]
+            self._student_text_embeddings_gpu = (
+                embeddings.detach()
+                .to(device=model_device, dtype=model_dtype)
+                .contiguous()
+            )
+            self._student_text_mask_gpu = torch.ones(
+                self._student_text_embeddings_gpu.shape[:2],
+                device=model_device,
+                dtype=model_dtype,
+            )
+            self._student_text_prompts = prompts
+        finally:
+            if restore_student_pipeline:
+                text_encoder = None
+                gc.collect()
+                self._clear_accelerator_cache()
+                self._move_pipe(self.device)
+                self._clear_accelerator_cache()
 
     def _student_text_condition(
         self, env_idx: int
@@ -534,6 +586,19 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         """Reset and build the student's native causal warmup prefix."""
         obs, info = super().reset(*args, **kwargs)
         self._encode_student_episode_instructions()
+        if (
+            self.student_release_text_encoder_after_reset
+            and self.pipe.model.text_encoder is not None
+        ):
+            # The steady-state student consumes the encoded tensor injected by
+            # _inject_student_text_condition and never calls Reason1 again. A
+            # one-episode 5090 smoke rollout can therefore release the 7B encoder
+            # before warmup; H800 training keeps the default resident behavior.
+            text_encoder = self.pipe.model.text_encoder
+            self.pipe.model.text_encoder = None
+            del text_encoder
+            gc.collect()
+            self._clear_accelerator_cache()
         self.student_bootstrap_complete = False
         if self.student_bootstrap_enabled:
             self._bootstrap_student_context()
@@ -650,6 +715,7 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         condition_frames = []
         action_history = []
         final_frames = []
+        bootstrap_frames = []
         for env_idx in range(self.num_envs):
             cosmos_actions = self._build_model_action(model_actions[env_idx]).to(
                 self.device
@@ -663,6 +729,8 @@ class DreamDojoStudentEnv(DreamDojoEnv):
             )
             pixels = ((video[0] + 1.0) / 2.0 * 255.0).clamp(0, 255).to(torch.uint8)
             generated = pixels[:, 1:]
+            if self.student_capture_bootstrap_frames:
+                bootstrap_frames.append(generated.permute(1, 0, 2, 3).contiguous())
             condition_frames.append(
                 generated[:, -self.student_context_pixel_frames :].contiguous()
             )
@@ -680,6 +748,9 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         self.current_obs = torch.stack(final_frames, dim=0).to(self.device)
         self.current_states = policy_actions[:, -1].to(self.device)
         self._last_action_state = policy_actions[:, -1].clone()
+        self.last_bootstrap_frames = (
+            torch.stack(bootstrap_frames, dim=0).cpu() if bootstrap_frames else None
+        )
         # Warmup frames are context only and never enter reward or GRPO loss.
         self.last_chunk_frames = None
 
@@ -799,15 +870,40 @@ class DreamDojoStudentEnv(DreamDojoEnv):
         )
         decode_latents = torch.cat([context_latents, predicted_latent], dim=2)
 
-        # The 8-GPU preset keeps both DiT and VAE resident. Do not move the DiT
-        # to CPU between generation and decode as the single-5090 path does.
-        decoded = self.pipe._decode(decode_latents).clip(min=-1, max=1)
-        if decoded.shape[2] < self.student_actions_per_latent:
-            raise RuntimeError(
-                "DreamDojo student decoded fewer than four frames: "
-                f"{tuple(decoded.shape)}"
+        dit_offloaded = False
+        if self.student_decode_dit_offload and self.device.type == "cuda":
+            # Generation is complete and the causal KV cache is no longer used by
+            # the VAE. Moving only the 2B DiT to host memory prevents its weights
+            # from overlapping the full-resolution decode peak on a 32 GiB card.
+            make_network_kv_cache(
+                model.net,
+                max_cache_size=self.student_cache_latents,
+                stateless=False,
             )
-        return decoded[:, :, -self.student_actions_per_latent :]
+            del x0, prefill_condition, generation_condition, noise
+            model.net = model.net.to("cpu")
+            dit_offloaded = True
+            gc.collect()
+            self._clear_accelerator_cache()
+
+        try:
+            decoded = self.pipe._decode(decode_latents).clip(min=-1, max=1)
+            if decoded.shape[2] < self.student_actions_per_latent:
+                raise RuntimeError(
+                    "DreamDojo student decoded fewer than four frames: "
+                    f"{tuple(decoded.shape)}"
+                )
+            result = decoded[:, :, -self.student_actions_per_latent :]
+            if dit_offloaded:
+                # Stage the small result on CPU before the DiT is restored. The
+                # caller moves it back with the rolling student state.
+                result = result.cpu()
+            del decoded, decode_latents
+            return result
+        finally:
+            if dit_offloaded:
+                model.net = model.net.to(self.device)
+                self._clear_accelerator_cache()
 
     @torch.no_grad()
     def _infer_next_chunk_frames(self, actions) -> None:
@@ -835,7 +931,7 @@ class DreamDojoStudentEnv(DreamDojoEnv):
                 env_idx,
                 model_actions,
                 self.seed_base + self.elapsed_steps + env_idx,
-            )
+            ).to(self.device)
             pixels = ((generated + 1.0) / 2.0).clamp(0, 1)
             pixels = (pixels[0] * 255.0).to(torch.uint8)
             new_chunks.append(pixels.permute(1, 0, 2, 3).contiguous())
@@ -856,3 +952,48 @@ class DreamDojoStudentEnv(DreamDojoEnv):
 
         self.current_obs = torch.stack(new_last_frames, dim=0).to(self.device)
         self.last_chunk_frames = torch.stack(new_chunks, dim=0).to(self.device)
+
+    def _move_pipe(self, device: torch.device | str) -> None:
+        """Move every student module, including the non-Module Reason1 wrapper."""
+        if self.pipe is None:
+            return
+        model = getattr(self.pipe, "model", None)
+        if model is None or not hasattr(model, "to"):
+            raise RuntimeError("DreamDojo student pipeline has no movable model.")
+        self.pipe.model = model.to(device)
+
+        # Cosmos TextEncoder is a plain Python wrapper, so model.to(...) does
+        # not visit its actual Qwen module. This matters for any caller that
+        # offloads a resident pipeline before the encoder is released.
+        text_encoder = getattr(self.pipe.model, "text_encoder", None)
+        encoder_model = getattr(text_encoder, "model", None)
+        if encoder_model is not None:
+            text_encoder.model = encoder_model.to(device)
+            text_encoder.device = str(device)
+
+    def _move_student_state(self, device: torch.device | str) -> None:
+        """Move the rolling causal state together with the base environment."""
+        for attr in (
+            "_student_condition_frames",
+            "_student_action_history",
+            "_student_text_embeddings_gpu",
+            "_student_text_mask_gpu",
+        ):
+            value = getattr(self, attr, None)
+            if value is not None:
+                setattr(self, attr, value.to(device))
+
+    def offload(self) -> None:
+        """Move the student pipeline and its rolling cache to host memory."""
+        if self._is_offloaded:
+            return
+        super().offload()
+        self._move_student_state("cpu")
+        self._clear_accelerator_cache()
+
+    def onload(self) -> None:
+        """Restore the student pipeline and rolling cache to its CUDA device."""
+        if not self._is_offloaded:
+            return
+        super().onload()
+        self._move_student_state(self.device)
